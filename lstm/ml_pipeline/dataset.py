@@ -1,131 +1,184 @@
+"""PyTorch Dataset for verification-based behavioral biometrics (triplet training)."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+import random
 from typing import Dict, List
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from data_loader import SessionSample
+from data_loader import (
+    preprocess_keystrokes,
+    preprocess_scrolls,
+    extract_imu_stats,
+)
 
 
-@dataclass
-class TripletRef:
-    anchor_user: str
-    anchor_idx: int
-    positive_idx: int
-    negative_user: str
-    negative_idx: int
-
-
-class BehavioralDataset(Dataset):
+class VerificationDataset(Dataset):
+    """
+    Dataset that returns (anchor, positive, negative) triplets.
+    
+    - Anchor: a sample from user X
+    - Positive: a DIFFERENT sample from user X (same person)
+    - Negative: a sample from user Y (different person)
+    
+    This trains the LSTM to produce embeddings where same-user
+    samples are close and different-user samples are far apart.
+    """
+    
     def __init__(
         self,
-        user_data: Dict[str, List[SessionSample]],
-        user_to_idx: Dict[str, int],
-        mode: str = "finetune_all",
-        triplets_per_user: int = 50,
-        is_training: bool = True,
-        seed: int = 42,
+        user_samples: Dict[str, List[Dict[str, list]]],
+        scalers_dict: Dict | None = None,
+        augment: bool = True
     ):
-        self.user_data = user_data
-        self.user_to_idx = user_to_idx
-        self.mode = mode
-        self.triplets_per_user = triplets_per_user
-        self.is_training = is_training
-        self.rng = np.random.default_rng(seed)
-
-        self.users = self._eligible_users(sorted(user_data.keys()))
-        if len(self.users) < 2:
-            raise ValueError(f"Need at least 2 users for mode={mode} triplet training.")
-
-        self.fixed_triplets: List[TripletRef] = []
-        if not is_training:
-            self.fixed_triplets = self._build_fixed_triplets()
-
-    def _eligible_users(self, users: List[str]) -> List[str]:
-        out = []
-        for u in users:
-            sessions = self.user_data[u]
-            if len(sessions) < 2:
-                continue
-
-            if self.mode == "pretrain_keys":
-                if any(s.has_keystroke for s in sessions):
-                    out.append(u)
-            elif self.mode == "pretrain_scrolls":
-                if any(s.has_scroll for s in sessions):
-                    out.append(u)
-            elif self.mode == "finetune_all":
-                if sessions[0].source == "booth" and any(s.has_keystroke and s.has_scroll and s.has_imu for s in sessions):
-                    out.append(u)
-            else:
-                raise ValueError(f"Unsupported mode: {self.mode}")
-
-        return out
-
-    def _sample_triplet(self) -> TripletRef:
-        anchor_user = self.rng.choice(self.users)
-        sessions = self.user_data[anchor_user]
-
-        idxs = self.rng.choice(len(sessions), size=2, replace=len(sessions) < 2)
-        anchor_idx, positive_idx = int(idxs[0]), int(idxs[1])
-
-        neg_candidates = [u for u in self.users if u != anchor_user]
-        negative_user = self.rng.choice(neg_candidates)
-        negative_idx = int(self.rng.integers(0, len(self.user_data[negative_user])))
-
-        return TripletRef(
-            anchor_user=anchor_user,
-            anchor_idx=anchor_idx,
-            positive_idx=positive_idx,
-            negative_user=negative_user,
-            negative_idx=negative_idx,
-        )
-
-    def _build_fixed_triplets(self) -> List[TripletRef]:
-        refs: List[TripletRef] = []
-        for u in self.users:
-            for _ in range(self.triplets_per_user):
-                refs.append(self._sample_triplet())
-        return refs
-
-    def __len__(self) -> int:
-        if self.is_training:
-            return len(self.users) * self.triplets_per_user
-        return len(self.fixed_triplets)
-
-    def _ref_at(self, idx: int) -> TripletRef:
-        if self.is_training:
-            return self._sample_triplet()
-        return self.fixed_triplets[idx]
-
-    def __getitem__(self, idx: int):
-        ref = self._ref_at(idx)
-
-        a = self.user_data[ref.anchor_user][ref.anchor_idx]
-        p = self.user_data[ref.anchor_user][ref.positive_idx]
-        n = self.user_data[ref.negative_user][ref.negative_idx]
-
-        return {
-            "anchor_keys": torch.tensor(a.keystrokes, dtype=torch.float32),
-            "anchor_scrolls": torch.tensor(a.scrolls, dtype=torch.float32),
-            "anchor_imu": torch.tensor(a.imu, dtype=torch.float32),
-            "anchor_key_mask": torch.tensor(1.0 if a.has_keystroke else 0.0, dtype=torch.float32),
-            "anchor_scroll_mask": torch.tensor(1.0 if a.has_scroll else 0.0, dtype=torch.float32),
-            "anchor_imu_mask": torch.tensor(1.0 if a.has_imu else 0.0, dtype=torch.float32),
-            "positive_keys": torch.tensor(p.keystrokes, dtype=torch.float32),
-            "positive_scrolls": torch.tensor(p.scrolls, dtype=torch.float32),
-            "positive_imu": torch.tensor(p.imu, dtype=torch.float32),
-            "positive_key_mask": torch.tensor(1.0 if p.has_keystroke else 0.0, dtype=torch.float32),
-            "positive_scroll_mask": torch.tensor(1.0 if p.has_scroll else 0.0, dtype=torch.float32),
-            "positive_imu_mask": torch.tensor(1.0 if p.has_imu else 0.0, dtype=torch.float32),
-            "negative_keys": torch.tensor(n.keystrokes, dtype=torch.float32),
-            "negative_scrolls": torch.tensor(n.scrolls, dtype=torch.float32),
-            "negative_imu": torch.tensor(n.imu, dtype=torch.float32),
-            "negative_key_mask": torch.tensor(1.0 if n.has_keystroke else 0.0, dtype=torch.float32),
-            "negative_scroll_mask": torch.tensor(1.0 if n.has_scroll else 0.0, dtype=torch.float32),
-            "negative_imu_mask": torch.tensor(1.0 if n.has_imu else 0.0, dtype=torch.float32),
-            "anchor_label": torch.tensor(self.user_to_idx[ref.anchor_user], dtype=torch.long),
+        """
+        Args:
+            user_samples: {user_id: [{keystrokes, scrolls, imu}, ...]}
+                          Each user must have >= 2 samples for positive pairs.
+            scalers_dict: {keystrokes: scaler, scrolls: scaler, imu: scaler}
+            augment: Whether to apply timing noise augmentation
+        """
+        self.scalers_dict = scalers_dict or {}
+        self.augment = augment
+        
+        # Only keep users with >= 2 samples (need positive pairs)
+        self.user_samples = {
+            uid: samples for uid, samples in user_samples.items()
+            if len(samples) >= 2
         }
+        self.user_ids = list(self.user_samples.keys())
+        
+        if len(self.user_ids) < 2:
+            raise ValueError(f"Need at least 2 users with 2+ samples, got {len(self.user_ids)}")
+        
+        # Flat index: [(user_id, sample_idx), ...]
+        self.index = []
+        for uid in self.user_ids:
+            for i in range(len(self.user_samples[uid])):
+                self.index.append((uid, i))
+        
+        print(f"VerificationDataset: {len(self.user_ids)} users, {len(self.index)} samples")
+    
+    def __len__(self) -> int:
+        return len(self.index)
+    
+    def _preprocess(self, sample: Dict[str, list]) -> Dict[str, torch.Tensor]:
+        """Preprocess a raw sample into model-ready tensors."""
+        ks_scaler = self.scalers_dict.get("keystrokes")
+        sc_scaler = self.scalers_dict.get("scrolls")
+        imu_scaler = self.scalers_dict.get("imu")
+        
+        keystrokes = preprocess_keystrokes(sample["keystrokes"], scaler=ks_scaler)
+        scrolls = preprocess_scrolls(sample["scrolls"], scaler=sc_scaler)
+        imu_stats = extract_imu_stats(sample["imu"], scaler=imu_scaler)
+        
+        # Add small noise for augmentation
+        if self.augment:
+            keystrokes[:, :, 1:] += np.random.normal(0, 0.02, keystrokes[:, :, 1:].shape).astype(np.float32)
+            if scrolls.any():
+                scrolls[:, :, 2:] += np.random.normal(0, 0.02, scrolls[:, :, 2:].shape).astype(np.float32)
+            if imu_stats.any():
+                imu_stats += np.random.normal(0, 0.02, imu_stats.shape).astype(np.float32)
+        
+        return {
+            "keystrokes": torch.from_numpy(keystrokes).float().squeeze(0),  # [8, 4]
+            "scrolls": torch.from_numpy(scrolls).float().squeeze(0),        # [20, 6]
+            "imu_stats": torch.from_numpy(imu_stats).float().squeeze(0),    # [4]
+        }
+    
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """
+        Returns a flat dict with anchor/pos/neg tensors.
+        Keys: anchor_keystrokes, anchor_scrolls, anchor_imu_stats,
+              pos_keystrokes, pos_scrolls, pos_imu_stats,
+              neg_keystrokes, neg_scrolls, neg_imu_stats
+        """
+        anchor_uid, anchor_sidx = self.index[idx]
+        
+        # Anchor
+        anchor = self._preprocess(self.user_samples[anchor_uid][anchor_sidx])
+        
+        # Positive: different sample from SAME user
+        pos_candidates = [i for i in range(len(self.user_samples[anchor_uid])) if i != anchor_sidx]
+        pos_sidx = random.choice(pos_candidates)
+        positive = self._preprocess(self.user_samples[anchor_uid][pos_sidx])
+        
+        # Negative: sample from DIFFERENT user
+        neg_uid = anchor_uid
+        while neg_uid == anchor_uid:
+            neg_uid = random.choice(self.user_ids)
+        neg_sidx = random.choice(range(len(self.user_samples[neg_uid])))
+        negative = self._preprocess(self.user_samples[neg_uid][neg_sidx])
+        
+        return {
+            "anchor_keystrokes": anchor["keystrokes"],
+            "anchor_scrolls": anchor["scrolls"],
+            "anchor_imu_stats": anchor["imu_stats"],
+            "pos_keystrokes": positive["keystrokes"],
+            "pos_scrolls": positive["scrolls"],
+            "pos_imu_stats": positive["imu_stats"],
+            "neg_keystrokes": negative["keystrokes"],
+            "neg_scrolls": negative["scrolls"],
+            "neg_imu_stats": negative["imu_stats"],
+        }
+
+
+def split_users(
+    user_samples: Dict[str, List[Dict[str, list]]],
+    train_ratio: float = 0.8,
+    seed: int = 42
+) -> tuple[Dict[str, List], Dict[str, List]]:
+    """
+    Split users into train and validation sets.
+    
+    Splits by USER (not by sample), so validation tests
+    on completely unseen users — the real verification task.
+    """
+    rng = random.Random(seed)
+    user_ids = list(user_samples.keys())
+    rng.shuffle(user_ids)
+    
+    split_idx = int(len(user_ids) * train_ratio)
+    train_ids = user_ids[:split_idx]
+    val_ids = user_ids[split_idx:]
+    
+    train_data = {uid: user_samples[uid] for uid in train_ids}
+    val_data = {uid: user_samples[uid] for uid in val_ids}
+    
+    return train_data, val_data
+
+
+if __name__ == "__main__":
+    from data_loader import load_raw_enrollment, load_keyrecs_fixed, window_user_data, load_scalers
+    from pathlib import Path
+    
+    root = Path(__file__).parent
+    db_path = root / "sentinel_lab.db"
+    
+    # Load and window DB data
+    unified_data = load_raw_enrollment(db_path)
+    user_samples = {}
+    for uid, data in unified_data.items():
+        windows = window_user_data(data)
+        if len(windows) >= 2:
+            user_samples[uid] = windows
+    
+    # Load keyrecs
+    keyrecs = load_keyrecs_fixed(root / "datasets" / "keyrecs" / "fixed-text.csv")
+    for uid, samples in keyrecs.items():
+        user_samples[f"kr_{uid}"] = samples
+    
+    scalers = load_scalers()
+    
+    train_data, val_data = split_users(user_samples)
+    print(f"Train users: {len(train_data)}, Val users: {len(val_data)}")
+    
+    dataset = VerificationDataset(train_data, scalers, augment=True)
+    print(f"Dataset size: {len(dataset)}")
+    
+    sample = dataset[0]
+    print(f"Sample keys: {list(sample.keys())}")
+    for k, v in sample.items():
+        print(f"  {k}: {v.shape}")

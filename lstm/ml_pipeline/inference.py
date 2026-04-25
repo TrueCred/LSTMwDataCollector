@@ -1,117 +1,157 @@
+"""Inference engine for behavioral authentication."""
 from __future__ import annotations
 
 import json
 import pickle
 from pathlib import Path
-from typing import Dict, List
+from typing import Optional
 
 import numpy as np
 import onnxruntime as ort
 
-from data_loader import KEY_VOCAB
+from data_loader import (
+    preprocess_keystrokes,
+    preprocess_scrolls,
+    extract_imu_stats,
+    KEY_VOCAB
+)
 
 
 class BehavioralInference:
+    """Inference engine for behavioral authentication."""
+    
     def __init__(
         self,
-        model_path: str | Path,
-        scalers_path: str | Path,
-        key_vocab_path: str | Path | None = None,
+        onnx_model_path: str | Path = "sentinel_encoder.onnx",
+        scalers_path: str | Path = "scalers.pkl",
+        key_vocab_path: str | Path = "key_vocab.json"
     ):
-        self.session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
-
-        with open(scalers_path, "rb") as f:
-            self.scalers: Dict = pickle.load(f)
-
-        if key_vocab_path is not None and Path(key_vocab_path).exists():
-            with open(key_vocab_path, "r", encoding="utf-8") as f:
-                self.key_to_idx = json.load(f)
+        """
+        Initialize inference engine.
+        
+        Args:
+            onnx_model_path: Path to sentinel_encoder.onnx
+            scalers_path: Path to scalers.pkl
+            key_vocab_path: Path to key_vocab.json
+        """
+        self.onnx_model_path = Path(onnx_model_path)
+        self.scalers_path = Path(scalers_path)
+        self.key_vocab_path = Path(key_vocab_path)
+        
+        # Load ONNX session
+        if self.onnx_model_path.exists():
+            self.session = ort.InferenceSession(str(self.onnx_model_path))
         else:
-            self.key_to_idx = KEY_VOCAB
-
-    def _encode_key(self, key: str) -> int:
-        if not key:
-            return 0
-        return int(self.key_to_idx.get(str(key), 0))
-
-    def preprocess_keystrokes(self, keystrokes_list: List[dict]) -> np.ndarray:
-        arr = np.zeros((8, 4), dtype=np.float32)
-        for i, ev in enumerate(keystrokes_list[:8]):
-            arr[i, 0] = float(self._encode_key(str(ev.get("key", ""))))
-            arr[i, 1] = np.log1p(max(0.0, float(ev.get("hold_time_ms", 0.0))))
-            arr[i, 2] = np.log1p(max(0.0, float(ev.get("flight_time_ms", 0.0))))
-            arr[i, 3] = float(ev.get("pressure", 0.5))
-
-        arr[:, 1:4] = self.scalers["keys_num"].transform(arr[:, 1:4])
-        return arr[np.newaxis, ...].astype(np.float32)
-
-    def preprocess_scrolls(self, scrolls_list: List[dict]) -> np.ndarray:
-        max_len = 20
-        arr = np.zeros((max_len, 6), dtype=np.float32)
-        for i, ev in enumerate(scrolls_list[:max_len]):
-            direction = float(ev.get("direction_deg", 0.0))
-            rad = np.deg2rad(direction)
-            arr[i, 0] = float(ev.get("velocity_px_per_sec", 0.0))
-            arr[i, 1] = np.sin(rad)
-            arr[i, 2] = np.cos(rad)
-            arr[i, 3] = float(ev.get("distance_px", 0.0))
-            arr[i, 4] = float(ev.get("avg_pressure", 0.5))
-            arr[i, 5] = float(ev.get("pixel_density_dpi", 0.0))
-
-        arr = self.scalers["scrolls"].transform(arr)
-        return arr[np.newaxis, ...].astype(np.float32)
-
-    def preprocess_imu(self, imu_list: List[dict]) -> np.ndarray:
-        target_len = 250
-        raw = np.zeros((len(imu_list), 5), dtype=np.float32)
-
-        for i, ev in enumerate(imu_list):
-            raw[i, 0] = float(ev.get("gyro_x", 0.0))
-            raw[i, 1] = float(ev.get("gyro_y", 0.0))
-            raw[i, 2] = float(ev.get("gyro_z", 0.0))
-            raw[i, 3] = float(ev.get("tilt_pitch", 0.0))
-            raw[i, 4] = float(ev.get("tilt_roll", 0.0))
-
-        if len(raw) == 0:
-            arr = np.zeros((target_len, 5), dtype=np.float32)
-        elif len(raw) >= target_len:
-            start = max(0, (len(raw) - target_len) // 2)
-            arr = raw[start:start + target_len]
+            self.session = None
+            print(f"Warning: ONNX model not found at {self.onnx_model_path}")
+        
+        # Load scalers
+        if self.scalers_path.exists():
+            with open(self.scalers_path, "rb") as f:
+                self.scalers = pickle.load(f)
         else:
-            reps = int(np.ceil(target_len / len(raw)))
-            arr = np.tile(raw, (reps, 1))[:target_len]
-
-        arr = self.scalers["imu"].transform(arr)
-        return arr[np.newaxis, ...].astype(np.float32)
-
-    def extract(self, keystrokes: List[dict], scrolls: List[dict], imu: List[dict]):
-        k = self.preprocess_keystrokes(keystrokes)
-        s = self.preprocess_scrolls(scrolls)
-        i = self.preprocess_imu(imu)
-
-        outputs = self.session.run(None, {"keystrokes": k, "scrolls": s, "imu": i})
-        if len(outputs) == 1:
-            dna = outputs[0]
-            risk = None
+            self.scalers = {}
+            print(f"Warning: Scalers not found at {self.scalers_path}")
+        
+        # Load key vocab
+        if self.key_vocab_path.exists():
+            with open(self.key_vocab_path, "r") as f:
+                self.key_vocab = json.load(f)
         else:
-            dna, risk = outputs[0], outputs[1]
+            self.key_vocab = KEY_VOCAB
+    
+    def extract_dna(
+        self,
+        keystrokes_list: list,
+        scrolls_list: list,
+        imu_list: list
+    ) -> Optional[np.ndarray]:
+        """
+        Extract DNA embedding from behavioral data.
+        
+        Args:
+            keystrokes_list: List of keystroke events
+            scrolls_list: List of scroll events
+            imu_list: List of IMU readings
+            
+        Returns:
+            numpy array of shape [1, 32] or None if inference fails
+        """
+        if self.session is None:
+            print("ONNX session not available")
+            return None
+        
+        try:
+            # Preprocess
+            ks_scaler = self.scalers.get("keystrokes")
+            sc_scaler = self.scalers.get("scrolls")
+            imu_scaler = self.scalers.get("imu")
+            
+            keystrokes = preprocess_keystrokes(keystrokes_list, scaler=ks_scaler)
+            scrolls = preprocess_scrolls(scrolls_list, scaler=sc_scaler)
+            imu_stats = extract_imu_stats(imu_list, scaler=imu_scaler)
+            
+            # Run inference
+            input_dict = {
+                "keystrokes": keystrokes.astype(np.float32),
+                "scrolls": scrolls.astype(np.float32),
+                "imu_stats": imu_stats.astype(np.float32)
+            }
+            
+            outputs = self.session.run(None, input_dict)
+            dna = outputs[0]  # [1, 32]
+            
+            return dna
+        except Exception as e:
+            print(f"Error in extract_dna: {e}")
+            return None
+    
+    def compute_risk(
+        self,
+        live_dna: np.ndarray,
+        template_dna: np.ndarray
+    ) -> float:
+        """
+        Compute risk score from live and template DNA.
+        
+        Args:
+            live_dna: [1, 32] numpy array
+            template_dna: [1, 32] numpy array
+            
+        Returns:
+            Risk score between 0 and 1 (0 = authentic, 1 = imposter)
+        """
+        from sklearn.metrics.pairwise import cosine_similarity
+        
+        similarity = cosine_similarity(live_dna, template_dna)[0, 0]
+        risk = 1.0 - float(similarity)
+        
+        return max(0.0, min(1.0, risk))
 
-        return dna, risk
 
-    def extract_dna(self, keystrokes: List[dict], scrolls: List[dict], imu: List[dict]) -> np.ndarray:
-        dna, _ = self.extract(keystrokes, scrolls, imu)
-        return dna
-
-    def extract_template(self, keystrokes: List[dict], scrolls: List[dict], imu: List[dict]) -> np.ndarray:
-        return self.extract_dna(keystrokes, scrolls, imu)
-
-    def compute_risk(self, live_dna: np.ndarray, template_dna: np.ndarray) -> float:
-        live = live_dna.reshape(1, -1)
-        tmpl = template_dna.reshape(1, -1)
-
-        live_norm = np.linalg.norm(live, axis=1, keepdims=True)
-        tmpl_norm = np.linalg.norm(tmpl, axis=1, keepdims=True)
-        denom = np.clip(live_norm * tmpl_norm, 1e-8, None)
-        sim = float(np.sum(live * tmpl, axis=1, keepdims=True) / denom)
-        sim = max(0.0, min(1.0, sim))
-        return float(1.0 - sim)
+if __name__ == "__main__":
+    # Test inference
+    inference = BehavioralInference()
+    
+    # Create dummy data
+    dummy_keystrokes = [
+        {"key": "v", "hold_time_ms": 50, "flight_time_ms": 20},
+        {"key": "k", "hold_time_ms": 45, "flight_time_ms": 25}
+    ]
+    dummy_scrolls = [
+        {"direction_deg": 90, "distance_px": 100},
+        {"direction_deg": 45, "distance_px": 150}
+    ]
+    dummy_imu = [
+        {"gyro_x": 0.5, "gyro_y": 0.3, "tilt_pitch": 10, "tilt_roll": 5}
+    ]
+    
+    dna = inference.extract_dna(dummy_keystrokes, dummy_scrolls, dummy_imu)
+    
+    if dna is not None:
+        print(f"DNA shape: {dna.shape}")
+        print(f"DNA norm: {np.linalg.norm(dna):.4f}")
+        
+        # Test risk computation
+        risk = inference.compute_risk(dna, dna)
+        print(f"Self-risk (should be ~0): {risk:.4f}")

@@ -1,406 +1,324 @@
+"""Training script for BehavioralLSTM — verification with triplet loss."""
 from __future__ import annotations
 
-import argparse
-import json
-import pickle
 from pathlib import Path
-from typing import Dict, List
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
+from sklearn.metrics.pairwise import cosine_similarity
 
 from data_loader import (
-    KEY_VOCAB,
-    SessionSample,
-    apply_scalers,
-    build_user_index,
-    fit_feature_scalers,
-    merge_all_sources,
-    split_users,
+    load_raw_enrollment, load_keyrecs_fixed, window_user_data,
+    fit_scalers_from_samples, save_scalers, save_key_vocab
 )
-from dataset import BehavioralDataset
-from model import TriBranchLSTM
-
-ROOT = Path(__file__).resolve().parent
-CHECKPOINT_DIR = ROOT / "checkpoints"
-CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-DEFAULT_DB = ROOT.parent.parent / "fastapiCollector" / "sentinel_lab.db"
-DEFAULT_DATASETS_DIR = ROOT / "datasets"
+from dataset import VerificationDataset, split_users
+from model import BehavioralLSTM
 
 
-def _subset(user_data: Dict[str, List[SessionSample]], users: List[str]) -> Dict[str, List[SessionSample]]:
-    return {u: user_data[u] for u in users if u in user_data}
+def compute_eer(genuine_scores: list, impostor_scores: list) -> float:
+    """
+    Compute Equal Error Rate from genuine and impostor similarity scores.
+    
+    Args:
+        genuine_scores: Cosine similarities for same-user pairs
+        impostor_scores: Cosine similarities for different-user pairs
+        
+    Returns:
+        EER value (lower is better, 0 = perfect)
+    """
+    genuine = np.array(genuine_scores)
+    impostor = np.array(impostor_scores)
+    
+    thresholds = np.linspace(0, 1, 1000)
+    
+    min_diff = float("inf")
+    eer = 0.5
+    
+    for t in thresholds:
+        frr = np.mean(genuine < t)    # False Reject: genuine pairs rejected
+        far = np.mean(impostor >= t)  # False Accept: impostors accepted
+        
+        diff = abs(frr - far)
+        if diff < min_diff:
+            min_diff = diff
+            eer = (frr + far) / 2
+    
+    return float(eer)
 
 
-def _batch_to_device(batch, device):
-    out = {}
-    for k, v in batch.items():
-        out[k] = v.to(device) if torch.is_tensor(v) else v
-    return out
-
-
-def evaluate(model, loader, device):
+def extract_all_embeddings(
+    model: BehavioralLSTM,
+    user_samples: dict,
+    scalers_dict: dict,
+    device: torch.device
+) -> dict:
+    """Extract DNA embeddings for all users' samples (no augmentation)."""
+    from data_loader import preprocess_keystrokes, preprocess_scrolls, extract_imu_stats
+    
     model.eval()
-    triplet_loss_fn = nn.TripletMarginLoss(margin=0.3)
-    bce_loss_fn = nn.BCELoss()
+    user_embeddings = {}
+    
+    with torch.no_grad():
+        for uid, samples in user_samples.items():
+            embeddings = []
+            for sample in samples[:20]:  # cap per user for speed
+                ks = preprocess_keystrokes(sample["keystrokes"], scalers_dict.get("keystrokes"))
+                sc = preprocess_scrolls(sample["scrolls"], scalers_dict.get("scrolls"))
+                imu = extract_imu_stats(sample["imu"], scalers_dict.get("imu"))
+                
+                ks_t = torch.from_numpy(ks).float().to(device)
+                sc_t = torch.from_numpy(sc).float().to(device)
+                imu_t = torch.from_numpy(imu).float().to(device)
+                
+                dna = model(ks_t, sc_t, imu_t, return_dna=True)
+                embeddings.append(dna.cpu().numpy()[0])
+            
+            user_embeddings[uid] = np.array(embeddings)
+    
+    return user_embeddings
 
-    losses = []
-    similarities = []
-    labels = []
 
+def evaluate_verification(user_embeddings: dict) -> tuple[float, float, float]:
+    """
+    Evaluate verification performance.
+    
+    Returns: (eer, mean_genuine_sim, mean_impostor_sim)
+    """
+    user_ids = list(user_embeddings.keys())
+    genuine_scores = []
+    impostor_scores = []
+    
+    for i, uid in enumerate(user_ids):
+        embs = user_embeddings[uid]
+        if len(embs) < 2:
+            continue
+        
+        # Genuine: pairs within same user
+        sims = cosine_similarity(embs)
+        for r in range(len(embs)):
+            for c in range(r + 1, len(embs)):
+                genuine_scores.append(sims[r, c])
+        
+        # Impostor: compare with other users
+        for j in range(i + 1, len(user_ids)):
+            other_embs = user_embeddings[user_ids[j]]
+            cross_sims = cosine_similarity(embs, other_embs)
+            impostor_scores.extend(cross_sims.flatten().tolist())
+    
+    if not genuine_scores or not impostor_scores:
+        return 0.5, 0.0, 0.0
+    
+    eer = compute_eer(genuine_scores, impostor_scores)
+    return eer, np.mean(genuine_scores), np.mean(impostor_scores)
+
+
+def train_epoch(
+    model: BehavioralLSTM,
+    loader: DataLoader,
+    optimizer: optim.Optimizer,
+    criterion: nn.TripletMarginLoss,
+    device: torch.device
+) -> float:
+    """Train one epoch with triplet loss. Returns avg loss."""
+    model.train()
+    total_loss = 0.0
+    n_batches = 0
+    
+    for batch in loader:
+        # Extract anchor, positive, negative
+        a_ks = batch["anchor_keystrokes"].to(device)
+        a_sc = batch["anchor_scrolls"].to(device)
+        a_imu = batch["anchor_imu_stats"].to(device)
+        
+        p_ks = batch["pos_keystrokes"].to(device)
+        p_sc = batch["pos_scrolls"].to(device)
+        p_imu = batch["pos_imu_stats"].to(device)
+        
+        n_ks = batch["neg_keystrokes"].to(device)
+        n_sc = batch["neg_scrolls"].to(device)
+        n_imu = batch["neg_imu_stats"].to(device)
+        
+        optimizer.zero_grad()
+        
+        # Get DNA embeddings
+        anchor_dna = model(a_ks, a_sc, a_imu, return_dna=True)
+        pos_dna = model(p_ks, p_sc, p_imu, return_dna=True)
+        neg_dna = model(n_ks, n_sc, n_imu, return_dna=True)
+        
+        loss = criterion(anchor_dna, pos_dna, neg_dna)
+        
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item()
+        n_batches += 1
+    
+    return total_loss / max(n_batches, 1)
+
+
+def eval_epoch(
+    model: BehavioralLSTM,
+    loader: DataLoader,
+    criterion: nn.TripletMarginLoss,
+    device: torch.device
+) -> float:
+    """Evaluate one epoch. Returns avg loss."""
+    model.eval()
+    total_loss = 0.0
+    n_batches = 0
+    
     with torch.no_grad():
         for batch in loader:
-            batch = _batch_to_device(batch, device)
-
-            a_dna, a_risk = model(
-                batch["anchor_keys"],
-                batch["anchor_scrolls"],
-                batch["anchor_imu"],
-                key_mask=batch["anchor_key_mask"],
-                scroll_mask=batch["anchor_scroll_mask"],
-                imu_mask=batch["anchor_imu_mask"],
-            )
-            p_dna, _ = model(
-                batch["positive_keys"],
-                batch["positive_scrolls"],
-                batch["positive_imu"],
-                key_mask=batch["positive_key_mask"],
-                scroll_mask=batch["positive_scroll_mask"],
-                imu_mask=batch["positive_imu_mask"],
-            )
-            n_dna, _ = model(
-                batch["negative_keys"],
-                batch["negative_scrolls"],
-                batch["negative_imu"],
-                key_mask=batch["negative_key_mask"],
-                scroll_mask=batch["negative_scroll_mask"],
-                imu_mask=batch["negative_imu_mask"],
-            )
-
-            triplet = triplet_loss_fn(a_dna, p_dna, n_dna)
-
-            owner_target = torch.zeros_like(a_risk)
-            imp_target = torch.ones_like(a_risk)
-
-            pos_risk = model(
-                batch["positive_keys"],
-                batch["positive_scrolls"],
-                batch["positive_imu"],
-                key_mask=batch["positive_key_mask"],
-                scroll_mask=batch["positive_scroll_mask"],
-                imu_mask=batch["positive_imu_mask"],
-            )[1]
-            neg_risk = model(
-                batch["negative_keys"],
-                batch["negative_scrolls"],
-                batch["negative_imu"],
-                key_mask=batch["negative_key_mask"],
-                scroll_mask=batch["negative_scroll_mask"],
-                imu_mask=batch["negative_imu_mask"],
-            )[1]
-
-            bce_owner = bce_loss_fn(a_risk, owner_target) + bce_loss_fn(pos_risk, owner_target)
-            bce_imp = bce_loss_fn(neg_risk, imp_target)
-            bce = 0.5 * (bce_owner + bce_imp)
-
-            total = triplet + 0.5 * bce
-            losses.append(float(total.item()))
-
-            sim_pos = torch.sum(a_dna * p_dna, dim=1).cpu().numpy()
-            sim_neg = torch.sum(a_dna * n_dna, dim=1).cpu().numpy()
-
-            similarities.extend(sim_pos.tolist())
-            labels.extend([1] * len(sim_pos))
-            similarities.extend(sim_neg.tolist())
-            labels.extend([0] * len(sim_neg))
-
-    eer = compute_eer(np.array(labels), np.array(similarities))
-    return float(np.mean(losses) if losses else 0.0), float(eer)
+            a_ks = batch["anchor_keystrokes"].to(device)
+            a_sc = batch["anchor_scrolls"].to(device)
+            a_imu = batch["anchor_imu_stats"].to(device)
+            
+            p_ks = batch["pos_keystrokes"].to(device)
+            p_sc = batch["pos_scrolls"].to(device)
+            p_imu = batch["pos_imu_stats"].to(device)
+            
+            n_ks = batch["neg_keystrokes"].to(device)
+            n_sc = batch["neg_scrolls"].to(device)
+            n_imu = batch["neg_imu_stats"].to(device)
+            
+            anchor_dna = model(a_ks, a_sc, a_imu, return_dna=True)
+            pos_dna = model(p_ks, p_sc, p_imu, return_dna=True)
+            neg_dna = model(n_ks, n_sc, n_imu, return_dna=True)
+            
+            loss = criterion(anchor_dna, pos_dna, neg_dna)
+            total_loss += loss.item()
+            n_batches += 1
+    
+    return total_loss / max(n_batches, 1)
 
 
-def compute_eer(labels: np.ndarray, scores: np.ndarray) -> float:
-    if len(labels) == 0:
-        return 1.0
-
-    thresholds = np.linspace(-1.0, 1.0, 400)
-    best_gap = 1.0
-    best_eer = 1.0
-
-    pos = labels == 1
-    neg = labels == 0
-
-    for th in thresholds:
-        far = np.mean(scores[neg] >= th) if np.any(neg) else 1.0
-        frr = np.mean(scores[pos] < th) if np.any(pos) else 1.0
-        gap = abs(far - frr)
-        if gap < best_gap:
-            best_gap = gap
-            best_eer = (far + frr) / 2.0
-
-    return float(best_eer)
-
-
-def _phase_train(
-    model: TriBranchLSTM,
-    phase_name: str,
-    all_data: Dict[str, List[SessionSample]],
-    user_to_idx: Dict[str, int],
-    mode: str,
-    epochs: int,
-    lr: float,
-    patience: int,
-    batch_size: int,
-    device,
-):
-    eligible = [u for u, sessions in all_data.items() if sessions]
-    phase_pool: Dict[str, List[SessionSample]] = {}
-    for uid in eligible:
-        s0 = all_data[uid][0]
-        if mode == "pretrain_keys" and any(s.has_keystroke for s in all_data[uid]):
-            phase_pool[uid] = all_data[uid]
-        elif mode == "pretrain_scrolls" and any(s.has_scroll for s in all_data[uid]):
-            phase_pool[uid] = all_data[uid]
-        elif mode == "finetune_all" and s0.source == "booth":
-            phase_pool[uid] = all_data[uid]
-
-    if len(phase_pool) < 2:
-        print(f"[WARN] Skipping {phase_name}; not enough users for mode={mode}.")
-        return {"skipped": True}
-
-    train_users, val_users, test_users = split_users(phase_pool)
-    train_data = _subset(phase_pool, train_users)
-    val_data = _subset(phase_pool, val_users) or train_data
-    test_data = _subset(phase_pool, test_users) or train_data
-
-    train_ds = BehavioralDataset(train_data, user_to_idx, mode=mode, triplets_per_user=50, is_training=True)
-    val_ds = BehavioralDataset(val_data, user_to_idx, mode=mode, triplets_per_user=20, is_training=False)
-    test_ds = BehavioralDataset(test_data, user_to_idx, mode=mode, triplets_per_user=20, is_training=False)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
-
-    device = torch.device("cpu")
-
-    triplet_loss_fn = nn.TripletMarginLoss(margin=0.3)
-    bce_loss_fn = nn.BCELoss()
-
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=5)
-
-    best_val_eer = 1.0
-    best_state = None
-    no_improve = 0
-
-    history = {
-        "phase": phase_name,
-        "mode": mode,
-        "train_loss": [],
-        "val_loss": [],
-        "val_eer": [],
-        "test_eer": None,
-        "split": {
-            "train_users": train_users,
-            "val_users": val_users,
-            "test_users": test_users,
-        },
-    }
-
-    for epoch in range(1, epochs + 1):
-        model.train()
-        epoch_losses = []
-
-        for batch in train_loader:
-            batch = _batch_to_device(batch, device)
-
-            optimizer.zero_grad()
-
-            a_dna, a_risk = model(
-                batch["anchor_keys"],
-                batch["anchor_scrolls"],
-                batch["anchor_imu"],
-                key_mask=batch["anchor_key_mask"],
-                scroll_mask=batch["anchor_scroll_mask"],
-                imu_mask=batch["anchor_imu_mask"],
-            )
-            p_dna, p_risk = model(
-                batch["positive_keys"],
-                batch["positive_scrolls"],
-                batch["positive_imu"],
-                key_mask=batch["positive_key_mask"],
-                scroll_mask=batch["positive_scroll_mask"],
-                imu_mask=batch["positive_imu_mask"],
-            )
-            n_dna, n_risk = model(
-                batch["negative_keys"],
-                batch["negative_scrolls"],
-                batch["negative_imu"],
-                key_mask=batch["negative_key_mask"],
-                scroll_mask=batch["negative_scroll_mask"],
-                imu_mask=batch["negative_imu_mask"],
-            )
-
-            triplet = triplet_loss_fn(a_dna, p_dna, n_dna)
-
-            owner_target = torch.zeros_like(a_risk)
-            imp_target = torch.ones_like(n_risk)
-            bce_owner = bce_loss_fn(a_risk, owner_target) + bce_loss_fn(p_risk, owner_target)
-            bce_imp = bce_loss_fn(n_risk, imp_target)
-            bce = 0.5 * (bce_owner + bce_imp)
-
-            loss = triplet + 0.5 * bce
-            loss.backward()
-            optimizer.step()
-
-            epoch_losses.append(float(loss.item()))
-
-        train_loss = float(np.mean(epoch_losses) if epoch_losses else 0.0)
-        val_loss, val_eer = evaluate(model, val_loader, device)
+def main():
+    """Main training pipeline for verification."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    if device.type == "cuda":
+        print(f"  GPU: {torch.cuda.get_device_name(0)}")
+    
+    root = Path(__file__).resolve().parent
+    checkpoint_dir = root / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    # ── 1. Load all data ──────────────────────────────────────────
+    db_path = root / "sentinel_lab.db"
+    keyrecs_path = root / "datasets" / "keyrecs" / "fixed-text.csv"
+    
+    # Load & window raw enrollment data
+    print("Loading raw enrollment data...")
+    unified_data = load_raw_enrollment(db_path)
+    print(f"  {len(unified_data)} users from DB")
+    
+    user_samples = {}
+    for uid, data in unified_data.items():
+        windows = window_user_data(data, ks_window=8, ks_stride=4)
+        if len(windows) >= 2:
+            user_samples[f"db_{uid[:8]}"] = windows
+    print(f"  Windowed -> {sum(len(v) for v in user_samples.values())} samples from {len(user_samples)} users")
+    
+    # Load keyrecs data
+    print("Loading keyrecs fixed-text data...")
+    keyrecs = load_keyrecs_fixed(keyrecs_path)
+    for uid, samples in keyrecs.items():
+        if len(samples) >= 2:
+            user_samples[f"kr_{uid}"] = samples
+    print(f"  Added {sum(len(v) for v in keyrecs.values())} keyrecs samples from {len(keyrecs)} participants")
+    
+    total_samples = sum(len(v) for v in user_samples.values())
+    print(f"\nTotal: {len(user_samples)} users, {total_samples} samples")
+    
+    # ── 2. Fit scalers ────────────────────────────────────────────
+    print("\nFitting scalers...")
+    all_flat = [s for samples in user_samples.values() for s in samples]
+    ks_scaler, sc_scaler, imu_scaler = fit_scalers_from_samples(all_flat)
+    save_scalers(ks_scaler, sc_scaler, imu_scaler, output_path=root / "scalers.pkl")
+    save_key_vocab(output_path=root / "key_vocab.json")
+    
+    scalers_dict = {"keystrokes": ks_scaler, "scrolls": sc_scaler, "imu": imu_scaler}
+    
+    # ── 3. Train/val split (by user) ─────────────────────────────
+    train_data, val_data = split_users(user_samples, train_ratio=0.8)
+    print(f"Train: {len(train_data)} users, {sum(len(v) for v in train_data.values())} samples")
+    print(f"Val:   {len(val_data)} users, {sum(len(v) for v in val_data.values())} samples")
+    
+    train_dataset = VerificationDataset(train_data, scalers_dict, augment=True)
+    val_dataset = VerificationDataset(val_data, scalers_dict, augment=False)
+    
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=0)
+    
+    # ── 4. Model ──────────────────────────────────────────────────
+    # num_users doesn't matter for verification, but keep for architecture compat
+    model = BehavioralLSTM(num_users=len(user_samples)).to(device)
+    
+    criterion = nn.TripletMarginLoss(margin=0.5, p=2)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
+    
+    # ── 5. Training loop ──────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Starting triplet training...")
+    print("=" * 60)
+    
+    best_val_loss = float("inf")
+    patience = 15
+    patience_counter = 0
+    
+    for epoch in range(100):
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
+        val_loss = eval_epoch(model, val_loader, criterion, device)
+        
+        print(f"Epoch {epoch+1:3d}/100 | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}", end="")
+        
         scheduler.step(val_loss)
-
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
-        history["val_eer"].append(val_eer)
-
-        print(f"[{phase_name}] epoch={epoch:03d} train_loss={train_loss:.4f} val_loss={val_loss:.4f} val_eer={val_eer:.4f}")
-
-        if val_eer < best_val_eer:
-            best_val_eer = val_eer
-            best_state = model.state_dict()
-            no_improve = 0
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), checkpoint_dir / "best_model.pt")
+            print(f"  <- saved (best)")
         else:
-            no_improve += 1
-
-        if no_improve >= patience:
-            print("Early stopping triggered.")
+            patience_counter += 1
+            print()
+        
+        if patience_counter >= patience:
+            print(f"\nEarly stopping at epoch {epoch+1}")
             break
-
-    if best_state is None:
-        best_state = model.state_dict()
-
-    model.load_state_dict(best_state)
-    test_loss, test_eer = evaluate(model, test_loader, device)
-    history["test_eer"] = float(test_eer)
-    history["test_loss"] = float(test_loss)
-
-    return history, best_state
-
-
-def _set_phase_freeze(model: TriBranchLSTM, phase: str) -> None:
-    for p in model.parameters():
-        p.requires_grad = True
-
-    if phase == "pretrain_keys":
-        for p in model.scroll_lstm.parameters():
-            p.requires_grad = False
-        for p in model.imu_lstm.parameters():
-            p.requires_grad = False
-    elif phase == "pretrain_scrolls":
-        for p in model.key_embed.parameters():
-            p.requires_grad = False
-        for p in model.key_lstm.parameters():
-            p.requires_grad = False
-        for p in model.imu_lstm.parameters():
-            p.requires_grad = False
-    elif phase == "finetune_all":
-        pass
+    
+    # -- 6. Evaluate verification performance ----------------------
+    print("\n" + "=" * 60)
+    print("Evaluating verification performance...")
+    print("=" * 60)
+    
+    model.load_state_dict(torch.load(checkpoint_dir / "best_model.pt", map_location=device))
+    
+    # Evaluate on validation users
+    val_embeddings = extract_all_embeddings(model, val_data, scalers_dict, device)
+    eer, mean_gen, mean_imp = evaluate_verification(val_embeddings)
+    
+    print(f"\nValidation Results:")
+    print(f"  EER:                      {eer:.4f}  (lower = better, 0 = perfect)")
+    print(f"  Mean genuine similarity:  {mean_gen:.4f}  (higher = better)")
+    print(f"  Mean impostor similarity: {mean_imp:.4f}  (lower = better)")
+    print(f"  Separation gap:           {mean_gen - mean_imp:.4f}")
+    
+    if eer < 0.15:
+        print("\n[OK] Good verification performance!")
+    elif eer < 0.30:
+        print("\n[WARN] Moderate performance -- may need more data or tuning")
     else:
-        raise ValueError(f"Unknown training phase: {phase}")
-
-
-def run_training(
-    db_path: Path = DEFAULT_DB,
-    datasets_dir: Path = DEFAULT_DATASETS_DIR,
-    phase: str = "all",
-    batch_size: int = 16,
-    lr: float = 1e-3,
-):
-    device = torch.device("cpu")
-
-    all_data = merge_all_sources(db_path, datasets_dir)
-    if len(all_data) < 2:
-        raise RuntimeError("Not enough users after merging datasets.")
-
-    scalers = fit_feature_scalers(all_data)
-    scaled_all = apply_scalers(all_data, scalers)
-    user_to_idx = build_user_index(scaled_all)
-
-    model = TriBranchLSTM(key_vocab_size=len(KEY_VOCAB)).to(device)
-
-    phase_plan = []
-    if phase == "all":
-        phase_plan = [
-            ("pretrain_keys", "pretrain_keys", 20, 5),
-            ("pretrain_scrolls", "pretrain_scrolls", 20, 5),
-            ("finetune_all", "finetune_all", 50, 10),
-        ]
-    elif phase in {"pretrain_keys", "pretrain_scrolls", "finetune_all"}:
-        epochs = 20 if phase != "finetune_all" else 50
-        patience = 5 if phase != "finetune_all" else 10
-        phase_plan = [(phase, phase, epochs, patience)]
-    else:
-        raise ValueError("--phase must be one of: all, pretrain_keys, pretrain_scrolls, finetune_all")
-
-    logs = {"phases": []}
-    last_state = None
-
-    for phase_name, mode, epochs, patience in phase_plan:
-        _set_phase_freeze(model, phase_name)
-        result = _phase_train(
-            model=model,
-            phase_name=phase_name,
-            all_data=scaled_all,
-            user_to_idx=user_to_idx,
-            mode=mode,
-            epochs=epochs,
-            lr=lr,
-            patience=patience,
-            batch_size=batch_size,
-            device=device,
-        )
-
-        if isinstance(result, dict) and result.get("skipped"):
-            logs["phases"].append({"phase": phase_name, "skipped": True})
-            continue
-
-        hist, state = result
-        logs["phases"].append(hist)
-        last_state = state
-        model.load_state_dict(state)
-
-    if last_state is None:
-        raise RuntimeError("All phases skipped. Ensure at least two users per selected phase.")
-
-    torch.save(last_state, CHECKPOINT_DIR / "best_model.pt")
-    with open(CHECKPOINT_DIR / "scalers.pkl", "wb") as f:
-        pickle.dump(scalers, f)
-    with open(CHECKPOINT_DIR / "key_vocab.json", "w", encoding="utf-8") as f:
-        json.dump(KEY_VOCAB, f)
-    with open(CHECKPOINT_DIR / "training_log.json", "w", encoding="utf-8") as f:
-        json.dump(logs, f, indent=2)
-
-    print(f"Saved model and artifacts to {CHECKPOINT_DIR}")
-
-
-def _parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--phase", default="all", choices=["all", "pretrain_keys", "pretrain_scrolls", "finetune_all"])
-    parser.add_argument("--db-path", default=str(DEFAULT_DB))
-    parser.add_argument("--datasets-dir", default=str(DEFAULT_DATASETS_DIR))
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    return parser.parse_args()
+        print("\n[FAIL] Poor performance -- model needs improvement")
+    
+    print(f"\nModel saved to: {checkpoint_dir / 'best_model.pt'}")
+    print(f"Scalers saved to: {root / 'scalers.pkl'}")
 
 
 if __name__ == "__main__":
-    args = _parse_args()
-    run_training(
-        db_path=Path(args.db_path),
-        datasets_dir=Path(args.datasets_dir),
-        phase=args.phase,
-        batch_size=args.batch_size,
-        lr=args.lr,
-    )
+    main()

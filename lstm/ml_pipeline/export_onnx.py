@@ -1,62 +1,76 @@
+"""Export BehavioralLSTM encoder to ONNX format."""
 from __future__ import annotations
 
 from pathlib import Path
 
 import torch
+import torch.onnx
 
-from data_loader import KEY_VOCAB
-from model import DNAOnlyWrapper, TriBranchLSTM
-
-ROOT = Path(__file__).resolve().parent
-CHECKPOINT_DIR = ROOT / "checkpoints"
+from model import BehavioralLSTM
 
 
-def export():
-    model = TriBranchLSTM(key_vocab_size=len(KEY_VOCAB))
-    state = torch.load(CHECKPOINT_DIR / "best_model.pt", map_location="cpu")
-    model.load_state_dict(state)
+def export_to_onnx(
+    model_path: str | Path,
+    output_path: str | Path,
+    num_users: int = 40,
+    device: str = "cpu"
+) -> None:
+    """
+    Export encoder part of BehavioralLSTM to ONNX.
+    
+    Args:
+        model_path: Path to best_model.pt
+        output_path: Path to output sentinel_encoder.onnx
+        num_users: Number of users in original model
+        device: Device to use (cpu)
+    """
+    model_path = Path(model_path)
+    output_path = Path(output_path)
+    
+    # Load checkpoint and auto-detect num_users from classifier shape
+    state_dict = torch.load(model_path, map_location=device)
+    num_users = state_dict["classifier.bias"].shape[0]
+    
+    model = BehavioralLSTM(num_users=num_users).to(device)
+    model.load_state_dict(state_dict)
     model.eval()
-
-    dummy_keys = torch.randn(1, 8, 4)
-    dummy_scrolls = torch.randn(1, 20, 6)
-    dummy_imu = torch.randn(1, 250, 5)
-
+    
+    # Dummy inputs
+    batch_size = 1
+    dummy_keystrokes = torch.randn(batch_size, 8, 4, device=device)
+    dummy_scrolls = torch.randn(batch_size, 20, 6, device=device)
+    dummy_imu = torch.randn(batch_size, 4, device=device)
+    
+    # Export
     torch.onnx.export(
         model,
-        (dummy_keys, dummy_scrolls, dummy_imu),
-        CHECKPOINT_DIR / "sentinel_lstm.onnx",
-        input_names=["keystrokes", "scrolls", "imu"],
-        output_names=["dna", "risk"],
-        dynamic_axes={
-            "keystrokes": {0: "batch_size"},
-            "scrolls": {0: "batch_size"},
-            "imu": {0: "batch_size"},
-            "dna": {0: "batch_size"},
-            "risk": {0: "batch_size"},
-        },
-        opset_version=13,
-    )
-
-    dna_model = DNAOnlyWrapper(model)
-    dna_model.eval()
-
-    torch.onnx.export(
-        dna_model,
-        (dummy_keys, dummy_scrolls, dummy_imu),
-        CHECKPOINT_DIR / "sentinel_lstm_dna.onnx",
-        input_names=["keystrokes", "scrolls", "imu"],
+        args=(dummy_keystrokes, dummy_scrolls, dummy_imu, True),
+        f=str(output_path),
+        input_names=["keystrokes", "scrolls", "imu_stats"],
         output_names=["dna"],
+        opset_version=14,
+        do_constant_folding=True,
         dynamic_axes={
             "keystrokes": {0: "batch_size"},
             "scrolls": {0: "batch_size"},
-            "imu": {0: "batch_size"},
-            "dna": {0: "batch_size"},
+            "imu_stats": {0: "batch_size"},
+            "dna": {0: "batch_size"}
         },
-        opset_version=13,
+        verbose=True
     )
-
-    print("Exported ONNX models to", CHECKPOINT_DIR)
+    
+    print(f"Exported model to {output_path}")
 
 
 if __name__ == "__main__":
-    export()
+    root = Path(__file__).resolve().parent
+    checkpoint_dir = root / "checkpoints"
+    
+    model_path = checkpoint_dir / "best_model.pt"
+    output_path = root / "sentinel_encoder.onnx"
+    
+    if model_path.exists():
+        export_to_onnx(model_path, output_path)
+    else:
+        print(f"Model not found at {model_path}")
+        print("Run train.py first to generate the model")

@@ -1,673 +1,403 @@
+"""Data loading and preprocessing for behavioral biometrics."""
 from __future__ import annotations
 
 import json
-import re
+import pickle
 import sqlite3
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
+# Key vocabulary mapping
 KEY_VOCAB = {
-    "v": 0,
-    "k": 1,
-    "e": 2,
-    "r": 3,
-    "j": 4,
-    "p": 5,
-    "w": 6,
-    "u": 7,
-    "1": 8,
-    "3": 9,
-    "7": 10,
-    "9": 11,
-    "2": 12,
-    "8": 13,
-    "4": 14,
-    "6": 15,
-    " ": 16,
+    "v": 1, "k": 2, "e": 3, "r": 4, "j": 5, "p": 6, "w": 7, "u": 8,
+    "1": 9, "3": 10, "7": 11, "9": 12, "2": 13, "8": 14, "4": 15, "6": 16
 }
 
-UNKNOWN_KEY_INDEX = 0
-
-
-@dataclass
-class SessionSample:
-    user_id: str
-    keystrokes: np.ndarray  # [8,4]
-    scrolls: np.ndarray  # [20,6]
-    imu: np.ndarray  # [250,5]
-    has_keystroke: bool
-    has_scroll: bool
-    has_imu: bool
-    source: str
-
-
-def _db_connect(db_path: str | Path) -> sqlite3.Connection:
-    return sqlite3.connect(str(db_path))
-
-
-def _safe_json_load(text: str | None) -> list:
-    if not text:
-        return []
-    try:
-        data = json.loads(text)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-
-def _encode_key(key: str) -> int:
-    if not key:
-        return UNKNOWN_KEY_INDEX
-    return KEY_VOCAB.get(str(key), UNKNOWN_KEY_INDEX)
-
-
-def _zero_keys() -> np.ndarray:
-    return np.zeros((8, 4), dtype=np.float32)
-
-
-def _zero_scrolls() -> np.ndarray:
-    return np.zeros((20, 6), dtype=np.float32)
-
-
-def _zero_imu() -> np.ndarray:
-    return np.zeros((250, 5), dtype=np.float32)
-
-
-def _keystrokes_to_fixed(events: List[dict]) -> np.ndarray:
-    out = np.zeros((8, 4), dtype=np.float32)
-    for i, ev in enumerate(events[:8]):
-        out[i, 0] = float(_encode_key(str(ev.get("key", ""))))
-        out[i, 1] = np.log1p(max(0.0, float(ev.get("hold_time_ms", 0.0))))
-        out[i, 2] = np.log1p(max(0.0, float(ev.get("flight_time_ms", 0.0))))
-        out[i, 3] = float(ev.get("pressure", 0.5))
-    return out
-
-
-def _keystrokes_from_fixed_text_row(row: pd.Series) -> List[dict]:
-    """Parse KeyRecs fixed-text engineered-feature row into pseudo-keystroke events."""
-    key_order: List[str] = []
-    holds: Dict[str, float] = {}
-    flights: Dict[Tuple[str, str], float] = {}
-
-    for col_name in row.index:
-        col = str(col_name)
-        m_hold = re.match(r"^DU\.([^.]+)\.\1$", col)
-        if m_hold:
-            k = m_hold.group(1)
-            if k not in key_order:
-                key_order.append(k)
-            try:
-                holds[k] = float(row[col_name])
-            except Exception:
-                holds[k] = 0.0
-            continue
-
-        m_flight = re.match(r"^DD\.([^.]+)\.([^.]+)$", col)
-        if m_flight:
-            a, b = m_flight.group(1), m_flight.group(2)
-            try:
-                flights[(a, b)] = float(row[col_name])
-            except Exception:
-                flights[(a, b)] = 0.0
-
-    events: List[dict] = []
-    for i, k in enumerate(key_order):
-        prev = key_order[i - 1] if i > 0 else None
-        flight = 0.0 if prev is None else flights.get((prev, k), 0.0)
-        events.append(
-            {
-                "key": k,
-                "hold_time_ms": max(0.0, holds.get(k, 0.0) * 1000.0),
-                "flight_time_ms": max(0.0, flight * 1000.0),
-                "pressure": 0.5,
-            }
-        )
-
-    return events
-
-
-def _keystrokes_from_free_text_group(group_df: pd.DataFrame) -> List[dict]:
-    events: List[dict] = []
-
-    def as_float(v, default=0.0) -> float:
-        try:
-            return float(v)
-        except Exception:
-            return float(default)
-
-    for _, row in group_df.iterrows():
-        k1 = str(row.get("key1", ""))
-        k2 = str(row.get("key2", ""))
-        hold = as_float(row.get("DU.key1.key1", 0.0), 0.0)
-        flight = as_float(row.get("DD.key1.key2", 0.0), 0.0)
-
-        events.append(
-            {
-                "key": k1,
-                "hold_time_ms": max(0.0, hold * 1000.0),
-                "flight_time_ms": max(0.0, flight * 1000.0),
-                "pressure": 0.5,
-            }
-        )
-
-        # Ensure transition destination key appears in stream.
-        if k2 and (not events or events[-1]["key"] != k2):
-            events.append(
-                {
-                    "key": k2,
-                    "hold_time_ms": max(0.0, hold * 1000.0),
-                    "flight_time_ms": 0.0,
-                    "pressure": 0.5,
-                }
-            )
-
-    return events
-
-
-def _events_from_keystroke_frame(df: pd.DataFrame) -> List[dict]:
-    cols = {c.lower(): c for c in df.columns}
-
-    def cands(*names: str) -> Optional[str]:
-        for n in names:
-            if n in cols:
-                return cols[n]
-        return None
-
-    key_col = cands("key", "character", "char", "key_char")
-    hold_col = cands("hold_time", "hold_time_ms", "hold", "dwell", "dwell_time", "duration")
-    flight_col = cands("flight_time", "flight_time_ms", "flight", "latency", "inter_key")
-    pressure_col = cands("pressure", "force")
-    ts_col = cands("timestamp", "time", "ts")
-
-    if key_col is None:
-        return []
-
-    frame = df.copy()
-    if ts_col is not None:
-        frame = frame.sort_values(ts_col)
-
-    events: List[dict] = []
-    prev_ts = None
-    for _, row in frame.iterrows():
-        key = str(row.get(key_col, ""))
-        hold = float(row.get(hold_col, 0.0) if hold_col else 0.0)
-        pressure = float(row.get(pressure_col, 0.5) if pressure_col else 0.5)
-
-        if flight_col is not None:
-            flight = float(row.get(flight_col, 0.0))
-        elif ts_col is not None:
-            ts_val = float(row.get(ts_col, 0.0))
-            flight = 0.0 if prev_ts is None else max(0.0, ts_val - prev_ts)
-            prev_ts = ts_val
-        else:
-            flight = 0.0
-
-        events.append(
-            {
-                "key": key,
-                "hold_time_ms": hold,
-                "flight_time_ms": flight,
-                "pressure": pressure,
-            }
-        )
-
-    return events
-
-
-def _scrolls_to_fixed(events: List[dict], max_len: int = 20) -> np.ndarray:
-    out = np.zeros((max_len, 6), dtype=np.float32)
-    for i, ev in enumerate(events[:max_len]):
-        velocity = float(ev.get("velocity_px_per_sec", 0.0))
-        direction = float(ev.get("direction_deg", 0.0))
-        distance = float(ev.get("distance_px", 0.0))
-        pressure = float(ev.get("avg_pressure", 0.5))
-        density = float(ev.get("pixel_density_dpi", 0.0))
-
-        rad = np.deg2rad(direction)
-        out[i, 0] = velocity
-        out[i, 1] = np.sin(rad)
-        out[i, 2] = np.cos(rad)
-        out[i, 3] = distance
-        out[i, 4] = pressure
-        out[i, 5] = density
-    return out
-
-
-def _touch_points_to_scroll_events(points: pd.DataFrame) -> List[dict]:
-    cols = {c.lower(): c for c in points.columns}
-
-    def col(*names: str) -> Optional[str]:
-        for name in names:
-            if name in cols:
-                return cols[name]
-        return None
-
-    time_col = col("time", "timestamp", "ts")
-    action_col = col("action", "event", "event_type")
-    x_col = col("x", "pos_x")
-    y_col = col("y", "pos_y")
-    pressure_col = col("pressure", "force")
-
-    if time_col is None or x_col is None or y_col is None:
-        return []
-
-    df = points.sort_values(time_col)
-    actions = df[action_col] if action_col else pd.Series(np.ones(len(df)), index=df.index)
-
-    events: List[dict] = []
-    down_row = None
-    pressure_track: List[float] = []
-
-    for idx, row in df.iterrows():
-        action = int(row.get(action_col, 1)) if action_col else 1
-
-        if action == 0:
-            down_row = row
-            pressure_track = [float(row.get(pressure_col, 0.5)) if pressure_col else 0.5]
-            continue
-
-        if down_row is None:
-            continue
-
-        pressure_track.append(float(row.get(pressure_col, 0.5)) if pressure_col else 0.5)
-
-        if action == 1 or idx == df.index[-1]:
-            dt = float(row[time_col]) - float(down_row[time_col])
-            dx = float(row[x_col]) - float(down_row[x_col])
-            dy = float(row[y_col]) - float(down_row[y_col])
-            dist = float(np.sqrt(dx * dx + dy * dy))
-
-            if dt <= 0.0 or dist <= 0.0:
-                down_row = None
-                pressure_track = []
-                continue
-
-            deg = float(np.degrees(np.arctan2(dy, dx)))
-            vel = dist / dt * 1000.0
-
-            events.append(
-                {
-                    "velocity_px_per_sec": vel,
-                    "direction_deg": deg,
-                    "distance_px": dist,
-                    "avg_pressure": float(np.mean(pressure_track) if pressure_track else 0.5),
-                    "pixel_density_dpi": 420.0,
-                }
-            )
-
-            down_row = None
-            pressure_track = []
-
-    return events
-
-
-def _resample_or_pad_imu(events: List[dict], target_len: int = 250) -> np.ndarray:
-    arr = np.zeros((len(events), 5), dtype=np.float32)
-    for i, ev in enumerate(events):
-        arr[i, 0] = float(ev.get("gyro_x", 0.0))
-        arr[i, 1] = float(ev.get("gyro_y", 0.0))
-        arr[i, 2] = float(ev.get("gyro_z", 0.0))
-        arr[i, 3] = float(ev.get("tilt_pitch", 0.0))
-        arr[i, 4] = float(ev.get("tilt_roll", 0.0))
-
-    if len(arr) == 0:
-        return np.zeros((target_len, 5), dtype=np.float32)
-
-    if len(arr) >= target_len:
-        start = max(0, (len(arr) - target_len) // 2)
-        return arr[start:start + target_len].astype(np.float32)
-
-    reps = int(np.ceil(target_len / len(arr)))
-    tiled = np.tile(arr, (reps, 1))
-    return tiled[:target_len].astype(np.float32)
-
-
-def parse_keyrecs(data_dir: str | Path = Path("datasets") / "keyrecs") -> Dict[str, List[SessionSample]]:
-    root = Path(data_dir)
-    if not root.exists():
-        print(f"[WARN] KeyRecs folder missing at {root}. Skipping.")
-        return {}
-
-    user_sessions: Dict[str, List[SessionSample]] = {}
-    csv_files = sorted(root.rglob("*.csv"))
-
-    for csv_path in csv_files:
-        try:
-            df = pd.read_csv(csv_path, low_memory=False)
-        except Exception:
-            continue
-
-        if df.empty:
-            continue
-
-        lowered = {str(c).lower().strip(): c for c in df.columns}
-
-        # KeyRecs fixed-text file
-        if "participant" in lowered and "repetition" in lowered and any(str(c).startswith("DU.") for c in df.columns):
-            for _, row in df.iterrows():
-                participant = str(row[lowered["participant"]])
-                uid = f"keyrecs::{participant}"
-                events = _keystrokes_from_fixed_text_row(row)
-                if len(events) < 4:
-                    continue
-                user_sessions.setdefault(uid, []).append(
-                    SessionSample(
-                        user_id=uid,
-                        keystrokes=_keystrokes_to_fixed(events),
-                        scrolls=_zero_scrolls(),
-                        imu=_zero_imu(),
-                        has_keystroke=True,
-                        has_scroll=False,
-                        has_imu=False,
-                        source="keyrecs",
-                    )
-                )
-            continue
-
-        # KeyRecs free-text file
-        if "participant" in lowered and "session" in lowered and "key1" in lowered and "key2" in lowered:
-            pcol = lowered["participant"]
-            scol = lowered["session"]
-            renamed = df.rename(columns={pcol: "participant", scol: "session"})
-            for (participant, session), grp in renamed.groupby(["participant", "session"]):
-                uid = f"keyrecs::{participant}"
-                events = _keystrokes_from_free_text_group(grp)
-                if len(events) < 4:
-                    continue
-                for i in range(0, len(events), 8):
-                    chunk = events[i:i + 8]
-                    if not chunk:
-                        continue
-                    user_sessions.setdefault(uid, []).append(
-                        SessionSample(
-                            user_id=uid,
-                            keystrokes=_keystrokes_to_fixed(chunk),
-                            scrolls=_zero_scrolls(),
-                            imu=_zero_imu(),
-                            has_keystroke=True,
-                            has_scroll=False,
-                            has_imu=False,
-                            source="keyrecs",
-                        )
-                    )
-            continue
-
-        # Fallback generic parser
-        uid_col = lowered.get("user_id") or lowered.get("userid") or lowered.get("user")
-        sess_col = lowered.get("session_id") or lowered.get("session") or lowered.get("phrase_id")
-        if uid_col is None:
-            continue
-
-        grouped = df.groupby([uid_col, sess_col]) if sess_col else [(None, df)]
-        for grp_key, group_df in grouped:
-            uid_val = str(grp_key[0]) if sess_col else str(group_df[uid_col].iloc[0])
-            uid = f"keyrecs::{uid_val}"
-            events = _events_from_keystroke_frame(group_df)
-            if len(events) < 4:
-                continue
-            user_sessions.setdefault(uid, []).append(
-                SessionSample(
-                    user_id=uid,
-                    keystrokes=_keystrokes_to_fixed(events),
-                    scrolls=_zero_scrolls(),
-                    imu=_zero_imu(),
-                    has_keystroke=True,
-                    has_scroll=False,
-                    has_imu=False,
-                    source="keyrecs",
-                )
-            )
-
-    return user_sessions
-
-
-def parse_touchalytics(data_dir: str | Path = Path("datasets") / "touchalytics") -> Dict[str, List[SessionSample]]:
-    root = Path(data_dir)
-    if not root.exists():
-        print(f"[WARN] Touchalytics folder missing at {root}. Skipping.")
-        return {}
-
-    csv_files = sorted(root.rglob("*.csv"))
-    if not csv_files:
-        print(f"[WARN] No Touchalytics CSV files found in {root}. Skipping.")
-        return {}
-
-    user_sessions: Dict[str, List[SessionSample]] = {}
-
-    for csv_path in csv_files:
-        try:
-            df = pd.read_csv(csv_path, low_memory=False)
-        except Exception:
-            continue
-
-        if df.empty:
-            continue
-
-        lowered = {str(c).lower().strip(): c for c in df.columns}
-
-        # Touchalytics official dump is often headerless 11-column CSV.
-        expected = [
-            "phone_id", "user_id", "doc_id", "time", "action", "orientation",
-            "x", "y", "pressure", "area", "finger_orientation",
-        ]
-        if all(str(c).isdigit() for c in df.columns[: min(5, len(df.columns))]) and len(df.columns) >= 11:
-            df.columns = expected[: len(df.columns)]
-            lowered = {str(c).lower().strip(): c for c in df.columns}
-
-        if "user_id" not in lowered and len(df.columns) >= 11:
-            # Retry explicit headerless read for robustness.
-            try:
-                df2 = pd.read_csv(csv_path, header=None, names=expected, low_memory=False)
-                if not df2.empty:
-                    df = df2
-                    lowered = {str(c).lower().strip(): c for c in df.columns}
-            except Exception:
-                pass
-
-        uid_col = lowered.get("user_id") or lowered.get("userid") or lowered.get("user") or lowered.get("phone_id")
-        doc_col = lowered.get("doc_id") or lowered.get("document_id") or lowered.get("session_id")
-
-        if uid_col is None:
-            continue
-
-        if doc_col is None:
-            df["_doc_id"] = "single"
-            doc_col = "_doc_id"
-
-        for (uid_raw, doc_raw), grp in df.groupby([uid_col, doc_col]):
-            uid = f"touchalytics::{uid_raw}"
-            events = _touch_points_to_scroll_events(grp)
-            if len(events) < 1:
-                continue
-
-            user_sessions.setdefault(uid, []).append(
-                SessionSample(
-                    user_id=uid,
-                    keystrokes=_zero_keys(),
-                    scrolls=_scrolls_to_fixed(events),
-                    imu=_zero_imu(),
-                    has_keystroke=False,
-                    has_scroll=True,
-                    has_imu=False,
-                    source="touchalytics",
-                )
-            )
-
-    return user_sessions
-
-
-def load_sessions_from_sqlite(
-    db_path: str | Path,
-    min_keys: int = 40,
-    min_scrolls: int = 5,
-    min_imu: int = 250,
-) -> Dict[str, List[SessionSample]]:
-    conn = _db_connect(db_path)
+# Keyrecs fixed-text key sequence: vpwjkeurkb
+KEYRECS_KEYS = ["v", "p", "w", "j", "k", "e", "u", "r", "k", "b"]
+KEYRECS_HOLD_COLS = [
+    "DU.v.v", "DU.p.p", "DU.w.w", "DU.j.j", "DU.k.k",
+    "DU.e.e", "DU.u.u", "DU.r.r", "DU.k.k.1", "DU.b.b"
+]
+KEYRECS_FLIGHT_COLS = [
+    None, "UD.v.p", "UD.p.w", "UD.w.j", "UD.j.k",
+    "UD.k.e", "UD.e.u", "UD.u.r", "UD.r.k", "UD.k.b"
+]
+
+
+def save_key_vocab(output_path: str | Path = "key_vocab.json") -> None:
+    """Save key vocabulary to JSON file."""
+    output_path = Path(output_path)
+    with open(output_path, "w") as f:
+        json.dump(KEY_VOCAB, f)
+    print(f"Saved key_vocab to {output_path}")
+
+
+def load_raw_enrollment(db_path: str | Path) -> Dict[str, Dict[str, list]]:
+    """
+    Load raw_enrollment table from database.
+    
+    Args:
+        db_path: Path to sentinel_lab.db
+        
+    Returns:
+        Dictionary {user_id: {keystrokes: [...], scrolls: [...], imu: [...]}}
+    """
+    db_path = Path(db_path)
+    conn = sqlite3.connect(str(db_path))
     cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT user_id, keystrokes_json, scrolls_json, imu_json
-        FROM raw_enrollment
-        """
-    )
-
-    grouped: Dict[str, List[SessionSample]] = {}
-
-    rows = cursor.fetchall()
-    conn.close()
-
-    for user_id, keys_json, scrolls_json, imu_json in rows:
-        key_events = _safe_json_load(keys_json)
-        scroll_events = _safe_json_load(scrolls_json)
-        imu_events = _safe_json_load(imu_json)
-
-        if len(key_events) < min_keys or len(scroll_events) < min_scrolls or len(imu_events) < min_imu:
-            continue
-
-        sample = SessionSample(
-            user_id=str(user_id),
-            keystrokes=_keystrokes_to_fixed(key_events),
-            scrolls=_scrolls_to_fixed(scroll_events),
-            imu=_resample_or_pad_imu(imu_events),
-            has_keystroke=True,
-            has_scroll=True,
-            has_imu=True,
-            source="booth",
-        )
-        grouped.setdefault(f"booth::{str(user_id)}", []).append(sample)
-
-    return grouped
+    
+    try:
+        cursor.execute("SELECT user_id, keystrokes_json, scrolls_json, imu_json FROM raw_enrollment")
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+    
+    unified_data = {}
+    for user_id, ks_json, sc_json, imu_json in rows:
+        keystrokes = json.loads(ks_json) if ks_json else []
+        scrolls = json.loads(sc_json) if sc_json else []
+        imu = json.loads(imu_json) if imu_json else []
+        
+        if user_id not in unified_data:
+            unified_data[user_id] = {"keystrokes": [], "scrolls": [], "imu": []}
+        
+        unified_data[user_id]["keystrokes"].extend(keystrokes)
+        unified_data[user_id]["scrolls"].extend(scrolls)
+        unified_data[user_id]["imu"].extend(imu)
+    
+    return unified_data
 
 
-def merge_all_sources(
-    sqlite_db_path: str | Path,
-    datasets_root: str | Path = Path("datasets"),
-) -> Dict[str, List[SessionSample]]:
-    datasets_root = Path(datasets_root)
+def load_keyrecs_fixed(csv_path: str | Path) -> Dict[str, List[Dict[str, list]]]:
+    """
+    Load keyrecs fixed-text.csv and convert to windowed samples per user.
+    
+    Each row is one typing session of 'vpwjkeurkb'. We extract per-key
+    hold times (DU.x.x) and inter-key flight times (UD.x.y).
+    
+    Returns:
+        {participant_id: [{keystrokes: [...], scrolls: [], imu: []}, ...]}
+        Each inner dict is one session (= one sample).
+    """
+    csv_path = Path(csv_path)
+    df = pd.read_csv(csv_path)
+    
+    user_samples: Dict[str, List[Dict[str, list]]] = {}
+    
+    for _, row in df.iterrows():
+        participant = str(row["participant"])
+        
+        # Build keystroke events from digraph timings
+        events = []
+        for i, key in enumerate(KEYRECS_KEYS):
+            hold_time = max(0.0, float(row[KEYRECS_HOLD_COLS[i]])) * 1000  # s→ms
+            
+            if KEYRECS_FLIGHT_COLS[i] is not None:
+                flight_time = max(0.0, float(row[KEYRECS_FLIGHT_COLS[i]])) * 1000
+            else:
+                flight_time = 0.0
+            
+            events.append({
+                "key": key,
+                "hold_time_ms": hold_time,
+                "flight_time_ms": flight_time
+            })
+        
+        sample = {"keystrokes": events, "scrolls": [], "imu": []}
+        
+        if participant not in user_samples:
+            user_samples[participant] = []
+        user_samples[participant].append(sample)
+    
+    return user_samples
 
-    booth = load_sessions_from_sqlite(sqlite_db_path)
-    keyrecs = parse_keyrecs(datasets_root / "keyrecs")
-    touchalytics = parse_touchalytics(datasets_root / "touchalytics")
 
-    merged: Dict[str, List[SessionSample]] = {}
-    for source_dict in (booth, keyrecs, touchalytics):
-        for uid, sessions in source_dict.items():
-            merged.setdefault(uid, []).extend(sessions)
+def window_user_data(
+    user_data: Dict[str, list],
+    ks_window: int = 8,
+    ks_stride: int = 4
+) -> List[Dict[str, list]]:
+    """
+    Window a single user's raw data into multiple samples.
+    
+    Keystrokes are windowed with overlap. Scrolls and IMU are
+    shared across windows (the preprocessor handles truncation/averaging).
+    
+    Args:
+        user_data: {keystrokes: [...], scrolls: [...], imu: [...]}
+        ks_window: Keystroke window size
+        ks_stride: Keystroke window stride
+        
+    Returns:
+        List of sample dicts, each with {keystrokes, scrolls, imu}
+    """
+    keystrokes = user_data["keystrokes"]
+    scrolls = user_data["scrolls"]
+    imu = user_data["imu"]
+    
+    samples = []
+    
+    if len(keystrokes) < ks_window:
+        # Not enough for even one window, use what we have
+        samples.append({"keystrokes": keystrokes, "scrolls": scrolls, "imu": imu})
+    else:
+        for start in range(0, len(keystrokes) - ks_window + 1, ks_stride):
+            ks_win = keystrokes[start:start + ks_window]
+            samples.append({"keystrokes": ks_win, "scrolls": scrolls, "imu": imu})
+    
+    return samples
 
-    return merged
+
+def preprocess_keystrokes(
+    keystrokes_list: list,
+    scaler: Optional[StandardScaler] = None
+) -> np.ndarray:
+    """
+    Preprocess keystrokes to [1, 8, 4] tensor.
+    
+    Takes last 8 keystrokes, applies log1p to hold/flight times, pads to 8.
+    
+    Args:
+        keystrokes_list: List of keystroke events with keys: 'key', 'hold_time_ms', 'flight_time_ms'
+        scaler: Optional StandardScaler for numerical features
+        
+    Returns:
+        numpy array of shape [1, 8, 4]
+    """
+    result = np.zeros((1, 8, 4), dtype=np.float32)
+    
+    if not keystrokes_list:
+        return result
+    
+    # Take last 8
+    events = keystrokes_list[-8:]
+    
+    for i, event in enumerate(events):
+        key = event.get("key", "")
+        key_idx = KEY_VOCAB.get(key, 0)
+        hold_time = max(0.0, float(event.get("hold_time_ms", 0.0)))
+        flight_time = max(0.0, float(event.get("flight_time_ms", 0.0)))
+        
+        result[0, i, 0] = float(key_idx)
+        result[0, i, 1] = np.log1p(hold_time)
+        result[0, i, 2] = np.log1p(flight_time)
+        result[0, i, 3] = 1.0  # placeholder for additional feature
+    
+    # Apply scaler if provided (to log1p features)
+    if scaler is not None:
+        features_to_scale = result[0, :, 1:4].reshape(-1, 3)
+        scaled = scaler.transform(features_to_scale)
+        result[0, :, 1:4] = scaled.reshape(8, 3)
+    
+    return result
 
 
-def fit_feature_scalers(user_sessions: Dict[str, List[SessionSample]]) -> Dict[str, StandardScaler]:
-    key_num = []
-    scroll = []
-    imu = []
+def preprocess_scrolls(
+    scrolls_list: list,
+    scaler: Optional[StandardScaler] = None
+) -> np.ndarray:
+    """
+    Preprocess scrolls to [1, 20, 6] tensor.
+    
+    Takes last 20 scrolls, converts direction_deg to sin/cos, pads to 20.
+    
+    Args:
+        scrolls_list: List of scroll events with keys: 'direction_deg', 'distance_px'
+        scaler: Optional StandardScaler for numerical features
+        
+    Returns:
+        numpy array of shape [1, 20, 6]
+    """
+    result = np.zeros((1, 20, 6), dtype=np.float32)
+    
+    if not scrolls_list:
+        return result
+    
+    # Take last 20
+    events = scrolls_list[-20:]
+    
+    for i, event in enumerate(events):
+        direction_deg = float(event.get("direction_deg", 0.0))
+        distance_px = max(0.0, float(event.get("distance_px", 0.0)))
+        
+        # Convert direction to sin/cos
+        angle_rad = np.radians(direction_deg)
+        
+        result[0, i, 0] = np.sin(angle_rad)
+        result[0, i, 1] = np.cos(angle_rad)
+        result[0, i, 2] = distance_px
+        result[0, i, 3] = 1.0  # velocity placeholder
+        result[0, i, 4] = 1.0  # acceleration placeholder
+        result[0, i, 5] = 1.0  # timestamp placeholder
+    
+    # Apply scaler if provided
+    if scaler is not None:
+        features_to_scale = result[0, :, 2:6].reshape(-1, 4)
+        scaled = scaler.transform(features_to_scale)
+        result[0, :, 2:6] = scaled.reshape(20, 4)
+    
+    return result
 
-    for sessions in user_sessions.values():
-        for s in sessions:
-            if s.has_keystroke:
-                key_num.append(s.keystrokes[:, 1:4])
-            if s.has_scroll:
-                scroll.append(s.scrolls)
-            if s.has_imu:
-                imu.append(s.imu)
 
-    if not key_num:
-        raise ValueError("No data available to fit scalers.")
+def extract_imu_stats(
+    imu_list: list,
+    scaler: Optional[StandardScaler] = None
+) -> np.ndarray:
+    """
+    Extract IMU statistics as [1, 4] tensor.
+    
+    Returns mean of gyro_x, gyro_y, tilt_pitch, tilt_roll.
+    
+    Args:
+        imu_list: List of IMU readings with keys: 'gyro_x', 'gyro_y', 'tilt_pitch', 'tilt_roll'
+        scaler: Optional StandardScaler for features
+        
+    Returns:
+        numpy array of shape [1, 4]
+    """
+    result = np.zeros((1, 4), dtype=np.float32)
+    
+    if not imu_list:
+        return result
+    
+    gyro_x_vals = []
+    gyro_y_vals = []
+    pitch_vals = []
+    roll_vals = []
+    
+    for reading in imu_list:
+        gyro_x_vals.append(float(reading.get("gyro_x", 0.0)))
+        gyro_y_vals.append(float(reading.get("gyro_y", 0.0)))
+        pitch_vals.append(float(reading.get("tilt_pitch", 0.0)))
+        roll_vals.append(float(reading.get("tilt_roll", 0.0)))
+    
+    result[0, 0] = np.mean(gyro_x_vals) if gyro_x_vals else 0.0
+    result[0, 1] = np.mean(gyro_y_vals) if gyro_y_vals else 0.0
+    result[0, 2] = np.mean(pitch_vals) if pitch_vals else 0.0
+    result[0, 3] = np.mean(roll_vals) if roll_vals else 0.0
+    
+    # Apply scaler if provided
+    if scaler is not None:
+        scaled = scaler.transform(result)
+        result[:] = scaled
+    
+    return result
 
-    key_num_arr = np.concatenate(key_num, axis=0)
-    scroll_arr = np.concatenate(scroll, axis=0) if scroll else np.zeros((1, 6), dtype=np.float32)
-    imu_arr = np.concatenate(imu, axis=0) if imu else np.zeros((1, 5), dtype=np.float32)
 
-    return {
-        "keys_num": StandardScaler().fit(key_num_arr),
-        "scrolls": StandardScaler().fit(scroll_arr),
-        "imu": StandardScaler().fit(imu_arr),
+def fit_scalers_from_samples(
+    all_samples: List[Dict[str, list]]
+) -> tuple[StandardScaler, StandardScaler, StandardScaler]:
+    """
+    Fit StandardScalers on a list of raw samples.
+    
+    Args:
+        all_samples: List of {keystrokes, scrolls, imu} dicts
+        
+    Returns:
+        Tuple of (keystrokes_scaler, scrolls_scaler, imu_scaler)
+    """
+    ks_features = []
+    sc_features = []
+    imu_features = []
+    
+    for sample in all_samples:
+        ks_array = preprocess_keystrokes(sample["keystrokes"])
+        ks_features.append(ks_array[0, :, 1:4].reshape(-1, 3))
+        
+        sc_array = preprocess_scrolls(sample["scrolls"])
+        sc_features.append(sc_array[0, :, 2:6].reshape(-1, 4))
+        
+        imu_array = extract_imu_stats(sample["imu"])
+        imu_features.append(imu_array[0, :])
+    
+    ks_all = np.vstack(ks_features)
+    sc_all = np.vstack(sc_features)
+    imu_all = np.vstack(imu_features)
+    
+    ks_scaler = StandardScaler()
+    ks_scaler.fit(ks_all)
+    
+    sc_scaler = StandardScaler()
+    sc_scaler.fit(sc_all)
+    
+    imu_scaler = StandardScaler()
+    imu_scaler.fit(imu_all)
+    
+    return ks_scaler, sc_scaler, imu_scaler
+
+
+# Keep legacy function for backward compatibility
+def fit_scalers(unified_data: Dict[str, Dict[str, list]]) -> tuple[StandardScaler, StandardScaler, StandardScaler]:
+    """Fit StandardScalers on unified data (legacy)."""
+    samples = [data for data in unified_data.values()]
+    return fit_scalers_from_samples(samples)
+
+
+def save_scalers(
+    ks_scaler: StandardScaler,
+    sc_scaler: StandardScaler,
+    imu_scaler: StandardScaler,
+    output_path: str | Path = "scalers.pkl"
+) -> None:
+    """Save scalers to pickle file."""
+    output_path = Path(output_path)
+    scalers = {
+        "keystrokes": ks_scaler,
+        "scrolls": sc_scaler,
+        "imu": imu_scaler
     }
+    with open(output_path, "wb") as f:
+        pickle.dump(scalers, f)
+    print(f"Saved scalers to {output_path}")
 
 
-def apply_scalers(
-    user_sessions: Dict[str, List[SessionSample]],
-    scalers: Dict[str, StandardScaler],
-) -> Dict[str, List[SessionSample]]:
-    out: Dict[str, List[SessionSample]] = {}
-    for uid, sessions in user_sessions.items():
-        out[uid] = []
-        for s in sessions:
-            k = s.keystrokes.copy()
-            sc = s.scrolls.copy()
-            im = s.imu.copy()
-
-            if s.has_keystroke:
-                k[:, 1:4] = scalers["keys_num"].transform(k[:, 1:4])
-            if s.has_scroll:
-                sc = scalers["scrolls"].transform(sc)
-            if s.has_imu:
-                im = scalers["imu"].transform(im)
-
-            out[uid].append(
-                SessionSample(
-                    user_id=uid,
-                    keystrokes=k,
-                    scrolls=sc,
-                    imu=im,
-                    has_keystroke=s.has_keystroke,
-                    has_scroll=s.has_scroll,
-                    has_imu=s.has_imu,
-                    source=s.source,
-                )
-            )
-    return out
-
-
-def build_user_index(user_sessions: Dict[str, List[SessionSample]]) -> Dict[str, int]:
-    users = sorted(user_sessions.keys())
-    return {u: i for i, u in enumerate(users)}
-
-
-def split_users(
-    user_sessions: Dict[str, List[SessionSample]],
-    train_ratio: float = 0.75,
-    val_ratio: float = 0.125,
-    seed: int = 42,
-) -> Tuple[List[str], List[str], List[str]]:
-    rng = np.random.default_rng(seed)
-    users = np.array(sorted(user_sessions.keys()))
-    rng.shuffle(users)
-
-    n = len(users)
-    n_train = max(1, int(n * train_ratio))
-    n_val = max(1, int(n * val_ratio)) if n >= 3 else 0
-
-    train_users = users[:n_train].tolist()
-    val_users = users[n_train:n_train + n_val].tolist()
-    test_users = users[n_train + n_val:].tolist()
-
-    if not test_users and len(train_users) > 1:
-        test_users = [train_users.pop()]
-
-    return train_users, val_users, test_users
+def load_scalers(input_path: str | Path = "scalers.pkl") -> Dict[str, StandardScaler]:
+    """Load scalers from pickle file."""
+    input_path = Path(input_path)
+    with open(input_path, "rb") as f:
+        scalers = pickle.load(f)
+    return scalers
 
 
 if __name__ == "__main__":
-    root = Path(__file__).resolve().parent
-    db_path = root / "datasets" / "sentinel_lab.db"
-    if not db_path.exists():
-        db_path = root.parent.parent / "fastapiCollector" / "sentinel_lab.db"
-
-    merged = merge_all_sources(db_path, root / "datasets")
-    by_source = {"booth": set(), "keyrecs": set(), "touchalytics": set()}
-
-    for uid, sessions in merged.items():
-        if not sessions:
-            continue
-        by_source[sessions[0].source].add(uid)
-
-    print(f"Booth users: {len(by_source['booth'])}")
-    print(f"KeyRecs users: {len(by_source['keyrecs'])}")
-    print(f"Touchalytics users: {len(by_source['touchalytics'])}")
-    print(f"Total users merged: {len(merged)}")
+    root = Path(__file__).parent
+    db_path = root / "sentinel_lab.db"
+    keyrecs_path = root / "datasets" / "keyrecs" / "fixed-text.csv"
+    
+    print(f"Loading raw enrollment from {db_path}")
+    unified_data = load_raw_enrollment(db_path)
+    print(f"  Loaded {len(unified_data)} users from DB")
+    
+    # Window DB data
+    db_samples = {}
+    for uid, data in unified_data.items():
+        windows = window_user_data(data)
+        if len(windows) >= 2:
+            db_samples[uid] = windows
+    print(f"  Windowed into {sum(len(v) for v in db_samples.values())} samples from {len(db_samples)} users")
+    
+    # Load keyrecs
+    print(f"\nLoading keyrecs from {keyrecs_path}")
+    keyrecs_samples = load_keyrecs_fixed(keyrecs_path)
+    print(f"  Loaded {sum(len(v) for v in keyrecs_samples.values())} samples from {len(keyrecs_samples)} participants")
+    
+    # Save key vocab
+    save_key_vocab()
+    
+    # Fit scalers on all samples combined
+    all_samples = []
+    for samples in db_samples.values():
+        all_samples.extend(samples)
+    for samples in keyrecs_samples.values():
+        all_samples.extend(samples)
+    
+    ks_scaler, sc_scaler, imu_scaler = fit_scalers_from_samples(all_samples)
+    save_scalers(ks_scaler, sc_scaler, imu_scaler)
+    
+    print(f"\nTotal: {len(all_samples)} samples across {len(db_samples) + len(keyrecs_samples)} users")
+    print("Data preprocessing complete")
