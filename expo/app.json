@@ -1,0 +1,28 @@
+{
+  "expo": {
+    "name": "Sentinel Biometrics",
+    "slug": "sentinel-biometrics",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#0D0D0D"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.sentinel.biometrics"
+    },
+    "android": {
+      "package": "com.sentinel.biometrics"
+    },
+    "plugins": [
+      [
+        "expo-sensors",
+        {
+          "motionPermission": "Allow Sentinel to access your device motion for biometric study."
+        }
+      ]
+    ]
+  }
+}

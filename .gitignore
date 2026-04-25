@@ -1,0 +1,11 @@
+pyvenv.cfg
+flutter_windows_3.41.7-stable.zip
+package-lock.json
+share\man\man1
+scripts
+.vscode
+Include
+expo\node_modules
+Lib
+share
+flutter_windows_3.41.7-stable
