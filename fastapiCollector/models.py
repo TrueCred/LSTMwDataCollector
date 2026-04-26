@@ -10,6 +10,7 @@ class User(Base):
 
     id = Column(String, primary_key=True)          # UUID or provided ID
     name = Column(String, nullable=False)
+    password_hash = Column(String, nullable=True)   # plain text for prototype
     source = Column(String, default="booth")        # "booth" for hackathon
     created_at = Column(DateTime, server_default=func.now())
 
@@ -32,4 +33,5 @@ class Template(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(String, ForeignKey("users.id"), unique=True, nullable=False)
     stats_vector = Column(Text)                     # JSON array of 13 floats
+    gaussian_profile = Column(Text, nullable=True)  # JSON: Gaussian biometric profile (mean + std)
     enrolled_at = Column(DateTime, server_default=func.now())

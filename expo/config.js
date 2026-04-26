@@ -17,8 +17,25 @@ export const MAX_QUEUE_SIZE = 50;
 // How often (ms) to send behavioral data for verification
 export const VERIFY_INTERVAL_MS = 15_000;
 
-// Risk thresholds for lockout
+// Risk thresholds for lockout (legacy)
 export const RISK_LOCK_THRESHOLD = 0.55;
+
+// Trust score thresholds (Gaussian engine)
+export const TRUST_THRESHOLDS = {
+  AUTHENTICATED:    0.65,  // green — genuine user
+  SOFT_CHALLENGE:   0.40,  // yellow — re-verify soon
+  HARD_CHALLENGE:   0.28,  // red — step-up auth required
+  SESSION_TERMINATE: 0.28, // below this → lock
+};
+
+// Trust level labels
+export const TRUST_LEVELS = {
+  authenticated:     { label: 'VERIFIED',        color: '#00D68F' },
+  soft_challenge:    { label: 'MONITORING',      color: '#FFAA00' },
+  hard_challenge:    { label: 'SUSPICIOUS',      color: '#FF6B35' },
+  session_terminate: { label: 'LOCKED',          color: '#FF3366' },
+  unknown:           { label: 'INITIALIZING...', color: '#555' },
+};
 
 export const STORAGE_KEYS = {
   USER_ID:          'truecred_user_id',
