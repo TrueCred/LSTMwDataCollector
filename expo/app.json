@@ -1,26 +1,26 @@
 {
   "expo": {
-    "name": "Sentinel Biometrics",
-    "slug": "sentinel-biometrics",
+    "name": "TrueCred",
+    "slug": "truecred",
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "splash": {
       "resizeMode": "contain",
-      "backgroundColor": "#0D0D0D"
+      "backgroundColor": "#0A0A0F"
     },
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "com.sentinel.biometrics"
+      "bundleIdentifier": "com.truecred.app"
     },
     "android": {
-      "package": "com.sentinel.biometrics"
+      "package": "com.truecred.app"
     },
     "plugins": [
       [
         "expo-sensors",
         {
-          "motionPermission": "Allow Sentinel to access your device motion for biometric study."
+          "motionPermission": "TrueCred uses device motion to verify your identity."
         }
       ]
     ]

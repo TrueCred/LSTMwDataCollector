@@ -158,18 +158,19 @@ def preprocess_keystrokes(
     scaler: Optional[StandardScaler] = None
 ) -> np.ndarray:
     """
-    Preprocess keystrokes to [1, 8, 4] tensor.
+    Preprocess keystrokes to [1, 8, 2] tensor (key-agnostic, timing only).
     
     Takes last 8 keystrokes, applies log1p to hold/flight times, pads to 8.
+    Features: [log_hold_time, log_flight_time]
     
     Args:
-        keystrokes_list: List of keystroke events with keys: 'key', 'hold_time_ms', 'flight_time_ms'
-        scaler: Optional StandardScaler for numerical features
+        keystrokes_list: List of keystroke events with keys: 'hold_time_ms', 'flight_time_ms'
+        scaler: Optional StandardScaler for features
         
     Returns:
-        numpy array of shape [1, 8, 4]
+        numpy array of shape [1, 8, 2]
     """
-    result = np.zeros((1, 8, 4), dtype=np.float32)
+    result = np.zeros((1, 8, 2), dtype=np.float32)
     
     if not keystrokes_list:
         return result
@@ -178,21 +179,17 @@ def preprocess_keystrokes(
     events = keystrokes_list[-8:]
     
     for i, event in enumerate(events):
-        key = event.get("key", "")
-        key_idx = KEY_VOCAB.get(key, 0)
         hold_time = max(0.0, float(event.get("hold_time_ms", 0.0)))
         flight_time = max(0.0, float(event.get("flight_time_ms", 0.0)))
         
-        result[0, i, 0] = float(key_idx)
-        result[0, i, 1] = np.log1p(hold_time)
-        result[0, i, 2] = np.log1p(flight_time)
-        result[0, i, 3] = 1.0  # placeholder for additional feature
+        result[0, i, 0] = np.log1p(hold_time)
+        result[0, i, 1] = np.log1p(flight_time)
     
-    # Apply scaler if provided (to log1p features)
+    # Apply scaler if provided
     if scaler is not None:
-        features_to_scale = result[0, :, 1:4].reshape(-1, 3)
+        features_to_scale = result[0, :, :].reshape(-1, 2)
         scaled = scaler.transform(features_to_scale)
-        result[0, :, 1:4] = scaled.reshape(8, 3)
+        result[0, :, :] = scaled.reshape(8, 2)
     
     return result
 
@@ -307,7 +304,7 @@ def fit_scalers_from_samples(
     
     for sample in all_samples:
         ks_array = preprocess_keystrokes(sample["keystrokes"])
-        ks_features.append(ks_array[0, :, 1:4].reshape(-1, 3))
+        ks_features.append(ks_array[0, :, :].reshape(-1, 2))
         
         sc_array = preprocess_scrolls(sample["scrolls"])
         sc_features.append(sc_array[0, :, 2:6].reshape(-1, 4))

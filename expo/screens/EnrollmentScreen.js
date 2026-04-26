@@ -1,5 +1,6 @@
 import React, { useLayoutEffect, useState } from 'react';
 import { Alert, StyleSheet, View } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import ProgressDots from '../components/ProgressDots';
 import KeystrokeStep from './steps/KeystrokeStep';
@@ -7,6 +8,7 @@ import ScrollStep from './steps/ScrollStep';
 import IMUStep from './steps/IMUStep';
 import ReviewStep from './steps/ReviewStep';
 import { enrollUser, pushToQueue } from '../utils/api';
+import { STORAGE_KEYS } from '../config';
 
 const STEP_LABELS = ['Type', 'Scroll', 'Motion', 'Submit'];
 
@@ -55,26 +57,28 @@ export default function EnrollmentScreen({ route, navigation }) {
 
     setSubmitting(true);
     try {
-      const result = await enrollUser(payload);
+      await enrollUser(payload);
+      await AsyncStorage.setItem(STORAGE_KEYS.IS_ENROLLED, 'true');
       Alert.alert(
         'Enrollment complete',
-        `Session saved: ${result.session_id}`,
+        'Your behavioral profile has been saved. Welcome to TrueCred!',
         [
           {
-            text: 'Done',
-            onPress: () => navigation.replace('Welcome'),
+            text: 'Continue',
+            onPress: () => navigation.replace('Dashboard'),
           },
         ]
       );
     } catch (err) {
       await pushToQueue(payload);
+      await AsyncStorage.setItem(STORAGE_KEYS.IS_ENROLLED, 'true');
       Alert.alert(
         'Saved Offline',
-        'Network issue detected. Your enrollment was queued and will auto-upload later.',
+        'Network issue detected. Your enrollment was queued and will upload later.',
         [
           {
             text: 'OK',
-            onPress: () => navigation.replace('Welcome'),
+            onPress: () => navigation.replace('Dashboard'),
           },
         ]
       );

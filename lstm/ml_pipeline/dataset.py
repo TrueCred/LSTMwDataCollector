@@ -74,16 +74,16 @@ class VerificationDataset(Dataset):
         scrolls = preprocess_scrolls(sample["scrolls"], scaler=sc_scaler)
         imu_stats = extract_imu_stats(sample["imu"], scaler=imu_scaler)
         
-        # Add small noise for augmentation
+        # Add small noise for augmentation (all features are timing-based now)
         if self.augment:
-            keystrokes[:, :, 1:] += np.random.normal(0, 0.02, keystrokes[:, :, 1:].shape).astype(np.float32)
+            keystrokes += np.random.normal(0, 0.02, keystrokes.shape).astype(np.float32)
             if scrolls.any():
                 scrolls[:, :, 2:] += np.random.normal(0, 0.02, scrolls[:, :, 2:].shape).astype(np.float32)
             if imu_stats.any():
                 imu_stats += np.random.normal(0, 0.02, imu_stats.shape).astype(np.float32)
         
         return {
-            "keystrokes": torch.from_numpy(keystrokes).float().squeeze(0),  # [8, 4]
+            "keystrokes": torch.from_numpy(keystrokes).float().squeeze(0),  # [8, 2]
             "scrolls": torch.from_numpy(scrolls).float().squeeze(0),        # [20, 6]
             "imu_stats": torch.from_numpy(imu_stats).float().squeeze(0),    # [4]
         }

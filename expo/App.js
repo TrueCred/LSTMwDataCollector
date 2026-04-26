@@ -3,33 +3,36 @@ import React from 'react';
 import { NavigationContainer, DarkTheme } from '@react-navigation/native';
 import { createStackNavigator } from '@react-navigation/stack';
 
-import WelcomeScreen from './screens/WelcomeScreen';
+import WelcomeScreen    from './screens/WelcomeScreen';
 import EnrollmentScreen from './screens/EnrollmentScreen';
+import LoginScreen      from './screens/LoginScreen';
+import DashboardScreen  from './screens/DashboardScreen';
+import LockScreen       from './screens/LockScreen';
 
 const Stack = createStackNavigator();
 
-const appTheme = {
+const theme = {
   ...DarkTheme,
   colors: {
     ...DarkTheme.colors,
-    background: '#0D0D0D',
-    card: '#121212',
-    text: '#FFFFFF',
-    border: '#232323',
-    primary: '#1A73E8',
+    background: '#0A0A0F',
+    card:       '#111118',
+    text:       '#FFFFFF',
+    border:     '#1E1E2A',
+    primary:    '#6C5CE7',
   },
 };
 
 export default function App() {
   return (
-    <NavigationContainer theme={appTheme}>
+    <NavigationContainer theme={theme}>
       <Stack.Navigator
         initialRouteName="Welcome"
         screenOptions={{
-          headerStyle: { backgroundColor: '#121212' },
+          headerStyle: { backgroundColor: '#111118' },
           headerTintColor: '#FFFFFF',
           headerTitleStyle: { fontWeight: '700' },
-          cardStyle: { backgroundColor: '#0D0D0D' },
+          cardStyle: { backgroundColor: '#0A0A0F' },
         }}
       >
         <Stack.Screen
@@ -41,6 +44,21 @@ export default function App() {
           name="Enrollment"
           component={EnrollmentScreen}
           options={{ title: 'Enrollment', headerBackTitleVisible: false }}
+        />
+        <Stack.Screen
+          name="Login"
+          component={LoginScreen}
+          options={{ headerShown: false }}
+        />
+        <Stack.Screen
+          name="Dashboard"
+          component={DashboardScreen}
+          options={{ headerShown: false }}
+        />
+        <Stack.Screen
+          name="Lock"
+          component={LockScreen}
+          options={{ headerShown: false }}
         />
       </Stack.Navigator>
     </NavigationContainer>

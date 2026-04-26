@@ -1,10 +1,8 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// config.js
-// Update API_BASE_URL to match the laptop running the FastAPI backend.
-// Both devices must be on the same WiFi network.
-// ─────────────────────────────────────────────────────────────────────────────
+// config.js — TrueCred app configuration
+export const API_BASE_URL =
+  process.env.EXPO_PUBLIC_API_BASE_URL || 'http://172.18.240.244:8000';
 
-export const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || 'http://127.0.0.1:8000';
+export const APP_NAME = 'TrueCred';
 
 export const PHRASES = [
   { id: 'balanced_random', text: 'vkerjpwu', reps: 5 },
@@ -13,11 +11,18 @@ export const PHRASES = [
 ];
 
 export const MIN_SCROLLS    = 10;
-export const IMU_DURATION_S = 30;  // seconds for IMU baseline
-export const MAX_QUEUE_SIZE = 50;  // max pending uploads in AsyncStorage
+export const IMU_DURATION_S = 30;
+export const MAX_QUEUE_SIZE = 50;
+
+// How often (ms) to send behavioral data for verification
+export const VERIFY_INTERVAL_MS = 15_000;
+
+// Risk thresholds for lockout
+export const RISK_LOCK_THRESHOLD = 0.55;
 
 export const STORAGE_KEYS = {
-  USER_ID:          'sentinel_user_id',
-  USER_NAME:        'sentinel_user_name',
-  PENDING_UPLOADS:  'sentinel_pending_uploads',
+  USER_ID:          'truecred_user_id',
+  USER_NAME:        'truecred_user_name',
+  IS_ENROLLED:      'truecred_is_enrolled',
+  PENDING_UPLOADS:  'truecred_pending_uploads',
 };

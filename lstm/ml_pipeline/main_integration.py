@@ -1,191 +1,247 @@
-"""FastAPI integration for behavioral authentication."""
+"""FastAPI backend for TrueCred behavioral authentication."""
 from __future__ import annotations
 
+import hashlib
 import json
+import uuid
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import sqlite3
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from inference import BehavioralInference
 
+# ── FastAPI app ───────────────────────────────────────────────────────────────
+app = FastAPI(title="TrueCred API")
 
-# Models
-class EnrollRequest(BaseModel):
-    user_id: str
-    keystrokes: list
-    scrolls: list
-    imu: list
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-
-class EnrollResponse(BaseModel):
-    status: str
-    user_id: str
-    enrolled_at: str
-
-
-class VerifyRequest(BaseModel):
-    user_id: str
-    keystrokes: list
-    scrolls: list
-    imu: list
-
-
-class VerifyResponse(BaseModel):
-    status: str
-    risk: float
-    risk_level: str
-    user_id: str
-
-
-# FastAPI app
-app = FastAPI()
-
-# Initialize inference engine
+# ── Inference engine ──────────────────────────────────────────────────────────
 root = Path(__file__).resolve().parent
 inference = BehavioralInference(
     onnx_model_path=root / "sentinel_encoder.onnx",
     scalers_path=root / "scalers.pkl",
-    key_vocab_path=root / "key_vocab.json"
+    key_vocab_path=root / "key_vocab.json",
 )
 
-# Database path (relative to ml_pipeline folder)
-db_path = Path(__file__).parent.parent.parent / "backend" / "sentinel_lab.db"
+# ── Database ──────────────────────────────────────────────────────────────────
+db_path = root / "truecred.db"
 
 
-def get_db_connection() -> sqlite3.Connection:
-    """Get database connection."""
-    return sqlite3.connect(str(db_path))
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-@app.post("/enroll", response_model=EnrollResponse)
-async def enroll(request: EnrollRequest) -> EnrollResponse:
-    """
-    Enroll a new user.
-    
-    Extracts DNA embedding and saves to templates table.
-    """
+def init_db():
+    conn = get_db()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            is_enrolled INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT UNIQUE NOT NULL,
+            dna_vector TEXT NOT NULL,
+            enrolled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+def hash_password(pw: str) -> str:
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+
+# ── Request / Response models ─────────────────────────────────────────────────
+class CreateUserReq(BaseModel):
+    name: str
+    password: str
+
+
+class LoginReq(BaseModel):
+    name: str
+    password: str
+
+
+class EnrollRequest(BaseModel):
+    user_id: str
+    keystrokes: list = []
+    scrolls: list = []
+    imu: list = []
+
+
+class VerifyRequest(BaseModel):
+    user_id: str
+    keystrokes: list = []
+    scrolls: list = []
+    imu: list = []
+
+
+# ── Temporal smoothing state (in-memory) ──────────────────────────────────────
+temporal_state: dict[str, float] = {}
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+@app.post("/users/create")
+async def create_user(req: CreateUserReq):
+    uid = str(uuid.uuid4())
+    conn = get_db()
     try:
-        # Extract DNA
-        dna = inference.extract_dna(request.keystrokes, request.scrolls, request.imu)
-        
-        if dna is None:
-            raise HTTPException(status_code=400, detail="Failed to extract DNA")
-        
-        # Store in templates table
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        try:
-            # Convert DNA to JSON strings (save individual components)
-            key_dna = json.dumps(dna[0, :].tolist())
-            scroll_dna = json.dumps(dna[0, :].tolist())  # Same embedding
-            imu_stats = json.dumps(dna[0, :].tolist())  # Same embedding
-            
-            cursor.execute(
-                """
-                INSERT OR REPLACE INTO templates (user_id, key_dna, scroll_dna, imu_stats)
-                VALUES (?, ?, ?, ?)
-                """,
-                (request.user_id, key_dna, scroll_dna, imu_stats)
-            )
-            conn.commit()
-            
-            # Get enrollment timestamp
-            cursor.execute("SELECT enrolled_at FROM templates WHERE user_id = ?", (request.user_id,))
-            row = cursor.fetchone()
-            enrolled_at = row[0] if row else ""
-            
-            return EnrollResponse(
-                status="success",
-                user_id=request.user_id,
-                enrolled_at=enrolled_at
-            )
-        finally:
-            conn.close()
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        conn.execute(
+            "INSERT INTO users (id, name, password_hash) VALUES (?, ?, ?)",
+            (uid, req.name, hash_password(req.password)),
+        )
+        conn.commit()
+        return {"user_id": uid, "name": req.name}
+    except sqlite3.IntegrityError:
+        raise HTTPException(400, "User already exists")
+    finally:
+        conn.close()
 
 
-# Temporal smoothing state (in-memory for demo)
-temporal_state = {}
-
-
-@app.post("/verify", response_model=VerifyResponse)
-async def verify(request: VerifyRequest) -> VerifyResponse:
-    """
-    Verify user identity.
-    
-    Extracts DNA, loads template, computes risk with temporal smoothing.
-    """
+@app.post("/users/login")
+async def login(req: LoginReq):
+    conn = get_db()
     try:
-        import numpy as np
-        
-        # Extract live DNA
-        live_dna = inference.extract_dna(request.keystrokes, request.scrolls, request.imu)
-        
-        if live_dna is None:
-            raise HTTPException(status_code=400, detail="Failed to extract DNA")
-        
-        # Load template
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute("SELECT key_dna FROM templates WHERE user_id = ?", (request.user_id,))
-            row = cursor.fetchone()
-            
-            if not row:
-                raise HTTPException(status_code=404, detail="User not enrolled")
-            
-            template_dna_json = row[0]
-            template_dna = np.array(json.loads(template_dna_json)).reshape(1, -1)
-            
-            # Compute risk
-            raw_risk = inference.compute_risk(live_dna, template_dna)
-            
-            # Apply temporal smoothing
-            prev_risk = temporal_state.get(request.user_id, raw_risk)
-            smoothed_risk = 0.7 * prev_risk + 0.3 * raw_risk
-            temporal_state[request.user_id] = smoothed_risk
-            
-            # Determine risk level
-            if smoothed_risk < 0.35:
-                risk_level = "normal"
-            elif smoothed_risk < 0.60:
-                risk_level = "caution"
-            elif smoothed_risk < 0.80:
-                risk_level = "warning"
-            else:
-                risk_level = "critical_locked"
-            
-            return VerifyResponse(
-                status="success",
-                risk=float(smoothed_risk),
-                risk_level=risk_level,
-                user_id=request.user_id
-            )
-        finally:
-            conn.close()
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        row = conn.execute(
+            "SELECT id, name, is_enrolled FROM users WHERE name = ? AND password_hash = ?",
+            (req.name, hash_password(req.password)),
+        ).fetchone()
+        if not row:
+            raise HTTPException(401, "Invalid credentials")
+        return {"user_id": row["id"], "name": row["name"], "is_enrolled": bool(row["is_enrolled"])}
+    finally:
+        conn.close()
+
+
+@app.post("/enroll")
+async def enroll(req: EnrollRequest):
+    """Enroll user — windows keystrokes and averages DNA across all windows."""
+    keystrokes = req.keystrokes or []
+    scrolls = req.scrolls or []
+    imu = req.imu or []
+
+    # Window keystrokes into 8-key chunks (matching model input size)
+    windows = []
+    for start in range(0, max(1, len(keystrokes) - 7), 4):
+        chunk = keystrokes[start:start + 8]
+        if len(chunk) >= 4:  # need at least 4 keystrokes
+            windows.append(chunk)
+
+    if not windows:
+        windows = [keystrokes]  # fallback: use whatever we have
+
+    # Extract DNA for each window and average
+    dna_vectors = []
+    for window in windows:
+        dna = inference.extract_dna(window, scrolls, imu)
+        if dna is not None:
+            dna_vectors.append(dna[0, :])
+
+    if not dna_vectors:
+        raise HTTPException(400, "Failed to extract behavioral DNA")
+
+    # Average and L2-normalize the template
+    avg_dna = np.mean(dna_vectors, axis=0)
+    avg_dna = avg_dna / (np.linalg.norm(avg_dna) + 1e-8)
+
+    print(f"Enrollment: {len(dna_vectors)} windows averaged for user {req.user_id[:8]}")
+
+    dna_json = json.dumps(avg_dna.tolist())
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO templates (user_id, dna_vector) VALUES (?, ?)",
+            (req.user_id, dna_json),
+        )
+        conn.execute("UPDATE users SET is_enrolled = 1 WHERE id = ?", (req.user_id,))
+        conn.commit()
+
+        row = conn.execute(
+            "SELECT enrolled_at FROM templates WHERE user_id = ?", (req.user_id,)
+        ).fetchone()
+        return {
+            "status": "enrolled",
+            "user_id": req.user_id,
+            "enrolled_at": row["enrolled_at"] if row else "",
+            "windows_used": len(dna_vectors),
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/verify")
+async def verify(req: VerifyRequest):
+    live_dna = inference.extract_dna(req.keystrokes, req.scrolls, req.imu)
+    if live_dna is None:
+        raise HTTPException(400, "Failed to extract behavioral DNA")
+
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT dna_vector FROM templates WHERE user_id = ?", (req.user_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "User not enrolled")
+
+        template_dna = np.array(json.loads(row["dna_vector"])).reshape(1, -1)
+        raw_risk = inference.compute_risk(live_dna, template_dna)
+
+        # Temporal smoothing (responsive: weights current reading more heavily)
+        prev = temporal_state.get(req.user_id, raw_risk)
+        smoothed = 0.3 * prev + 0.7 * raw_risk
+        temporal_state[req.user_id] = smoothed
+
+        if smoothed < 0.35:
+            level = "normal"
+        elif smoothed < 0.60:
+            level = "caution"
+        elif smoothed < 0.80:
+            level = "warning"
+        else:
+            level = "critical"
+
+        return {
+            "status": "verified",
+            "risk": round(float(smoothed), 4),
+            "raw_risk": round(float(raw_risk), 4),
+            "risk_level": level,
+            "user_id": req.user_id,
+        }
+    finally:
+        conn.close()
 
 
 @app.get("/health")
-async def health() -> dict:
-    """Health check endpoint."""
+async def health():
     return {
         "status": "healthy",
-        "inference_available": inference.session is not None,
-        "database": "available" if db_path.exists() else "not_found"
+        "model_loaded": inference.session is not None,
+        "database": "ok" if db_path.exists() else "missing",
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    
+    print("TrueCred API starting on http://0.0.0.0:8000")
     uvicorn.run(app, host="0.0.0.0", port=8000)
