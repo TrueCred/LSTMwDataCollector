@@ -5,17 +5,17 @@ Behavioral biometrics for continuous session protection. TrueCred watches how yo
 Built by Team Brothers: Utkrist Mani Neupane, Saksham Gyawali, Sammit Poudyal, Nishant Pandit.
 
 ## The problem
-
+ 
 Most apps stop caring about identity once you log in. That leaves a gap:
-
+ 
 - Passwords and OTPs do not help if the device is snatched while unlocked.
 - Remote access trojans and device takeover attacks can operate inside an already-authenticated session.
 - Financial apps lose public trust quickly after unauthorized transfers.
-
+ 
 TrueCred addresses the session itself, not just the login screen.
-
+ 
 ## How it works
-
+ 
 1. **Calibration** — During enrollment, the user scrolls, types fixed phrases, and holds the device normally. The system records keystroke timing, scroll dynamics, and IMU readings to build a baseline.
 2. **Silent monitoring** — While the app is in use, touch coordinates, velocity, flight time, and gyroscope data are collected in the background.
 3. **Trust scoring** — Live behavior is compared against the enrolled profile. The backend computes a trust score using a Gaussian profile engine (Mahalanobis distance across keystroke, scroll, and IMU features). An LSTM model is available as a secondary path when ONNX artifacts are present.
