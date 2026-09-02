@@ -12,6 +12,7 @@ import {
   StyleSheet,
   PixelRatio,
   Vibration,
+  Platform,
 } from 'react-native';
 import * as Haptics from 'expo-haptics';
 
@@ -178,7 +179,8 @@ const styles = StyleSheet.create({
   keyboard: {
     backgroundColor: '#1A1A1A',
     paddingHorizontal: 4,
-    paddingVertical: 8,
+    paddingTop: 8,
+    paddingBottom: Platform.OS === 'ios' ? 32 : 16,
     gap: KEY_GAP,
   },
   row: {

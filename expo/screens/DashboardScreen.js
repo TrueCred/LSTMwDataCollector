@@ -12,6 +12,7 @@ import {
   STORAGE_KEYS, APP_NAME, VERIFY_INTERVAL_MS,
   RISK_LOCK_THRESHOLD, TRUST_LEVELS, TRUST_THRESHOLDS,
 } from '../config';
+import GboardKeyboard from '../components/Gboardkeyboard';
 
 export default function DashboardScreen({ navigation }) {
   const [userName,    setUserName]    = useState('');
@@ -23,6 +24,8 @@ export default function DashboardScreen({ navigation }) {
   const [verifyCount, setVerifyCount] = useState(0);
   const [ksCount,     setKsCount]     = useState(0);
   const [modalScores, setModalScores] = useState(null);
+
+  const [showKeyboard, setShowKeyboard] = useState(false);
 
   // Animations
   const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -78,14 +81,23 @@ export default function DashboardScreen({ navigation }) {
     // Periodic verification
     verifyTimer.current = setInterval(() => { runVerification(); }, VERIFY_INTERVAL_MS);
 
-    const backHandler = BackHandler.addEventListener('hardwareBackPress', () => true);
-
     return () => {
       if (imuCollector.current) imuCollector.current.stop();
       if (verifyTimer.current) clearInterval(verifyTimer.current);
-      backHandler.remove();
     };
   }, []);
+
+  // ── Handle Back Press to hide keyboard ─────────────────────────────────
+  useEffect(() => {
+    const backHandler = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (showKeyboard) {
+        setShowKeyboard(false);
+        return true; // prevent default behavior (closing app/navigating back)
+      }
+      return true; // still prevent going back from Dashboard
+    });
+    return () => backHandler.remove();
+  }, [showKeyboard]);
 
   // ── Run verification ───────────────────────────────────────────────────
   const runVerification = useCallback(async () => {
@@ -330,21 +342,20 @@ export default function DashboardScreen({ navigation }) {
       {/* Typing area — captures keystroke timing passively */}
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>Notes</Text>
-        <TextInput
-          style={styles.noteInput}
-          placeholder="Type anything here... your typing rhythm is being monitored"
-          placeholderTextColor="#444"
-          value={noteText}
-          onChangeText={handleTextChange}
-          onKeyPress={handleKeyPress}
-          multiline
-          textAlignVertical="top"
-        />
+        <TouchableOpacity 
+          activeOpacity={0.8}
+          onPress={() => setShowKeyboard(true)}
+          style={[styles.noteInput, { minHeight: 80, justifyContent: 'flex-start' }]}
+        >
+          <Text style={{ color: '#FFF', fontSize: 16 }}>
+            {noteText || <Text style={{ color: '#444' }}>Tap to type... your typing rhythm is being monitored</Text>}
+          </Text>
+        </TouchableOpacity>
       </View>
 
       {/* Scrollable content */}
       <ScrollView
-        style={styles.feed}
+        style={[styles.feed, { flex: 1 }]}
         onScroll={handleScroll}
         scrollEventThrottle={200}
       >
@@ -363,6 +374,17 @@ export default function DashboardScreen({ navigation }) {
         ))}
         <View style={{ height: 40 }} />
       </ScrollView>
+
+      {/* Custom Keyboard for accurate keystroke timing */}
+      {showKeyboard && (
+        <View style={{ backgroundColor: '#1A1A1A' }}>
+          <GboardKeyboard
+            onKeystroke={handleKeystroke}
+            onBackspace={handleBackspace}
+            onEnter={handleEnter}
+          />
+        </View>
+      )}
     </View>
   );
 }
