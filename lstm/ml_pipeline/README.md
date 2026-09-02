@@ -1,8 +1,8 @@
 # LSTM Behavioral Pipeline
 
-Training and inference code for the neural side of TrueCred. The main backend uses a Gaussian statistical engine by default; this pipeline produces an optional LSTM encoder that maps keystroke, scroll, and IMU sequences into a 32-dimensional "behavioral DNA" vector for similarity comparison.
+Training and inference code for the neural side of TrueCred. The main backend uses a Gaussian statistical engine by default. This pipeline produces an optional LSTM encoder that maps keystroke, scroll, and IMU sequences into a 32-dimensional behavioral DNA vector for similarity comparison.
 
-Based on touch dynamics research ([Touchalytics](https://arxiv.org/pdf/1207.6231)).
+Based on touch dynamics research: [Touchalytics](https://arxiv.org/pdf/1207.6231).
 
 ## Model architecture
 
@@ -53,10 +53,10 @@ python test_pipeline.py
 
 Artifacts:
 
-- `checkpoints/best_model.pt` — trained weights
-- `checkpoints/scalers.pkl` — feature scalers
-- `checkpoints/key_vocab.json` — keystroke vocabulary
-- `sentinel_encoder.onnx` — exported encoder (written to this folder by `export_onnx.py`)
+- `checkpoints/best_model.pt`: trained weights
+- `checkpoints/scalers.pkl`: feature scalers
+- `checkpoints/key_vocab.json`: keystroke vocabulary
+- `sentinel_encoder.onnx`: exported encoder (written to this folder by `export_onnx.py`)
 
 The main backend expects the ONNX file at `checkpoints/sentinel_lstm.onnx`. After export, copy or rename:
 
